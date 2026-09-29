@@ -21,23 +21,23 @@ pub fn valid_profile(name: &str) -> Result<String, Error> {
 pub struct Profiles {
     pub names: Vec<String>,
     /// The Gateway's default Profile (`hermes profile use`), if it's one of `names`.
-    pub active: Option<String>,
+    pub gateway_default: Option<String>,
 }
 
 /// `hermes profile list` prints a table: rows follow the `───` rule and end at a blank line, and
 /// the sticky default is marked `◆`.
 pub fn parse_profile_list(text: &str) -> Profiles {
     let mut names = Vec::new();
-    let mut active = None;
+    let mut gateway_default = None;
     for line in text.lines().skip_while(|l| !l.contains('─')).skip(1).take_while(|l| !l.trim().is_empty()) {
         let line = line.trim_start();
         let Some(Ok(name)) = line.trim_start_matches('◆').split_whitespace().next().map(valid_profile) else { continue };
         if line.starts_with('◆') {
-            active = Some(name.clone());
+            gateway_default = Some(name.clone());
         }
         names.push(name);
     }
-    Profiles { names, active }
+    Profiles { names, gateway_default }
 }
 
 /// Dashboard `GET /api/profiles` plus `GET /api/profiles/active`.
@@ -48,8 +48,8 @@ pub fn from_dashboard(list: &Value, active: &Value) -> Profiles {
         .flatten()
         .filter_map(|p| valid_profile(p["name"].as_str()?).ok())
         .collect();
-    let active = active["active"].as_str().filter(|a| names.iter().any(|n| n == a)).map(str::to_owned);
-    Profiles { names, active }
+    let gateway_default = active["active"].as_str().filter(|a| names.iter().any(|n| n == a)).map(str::to_owned);
+    Profiles { names, gateway_default }
 }
 
 /// `/p/<name>/…` addresses a named Profile on a multiplexing gateway; `default` is the bare path.
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn profile_table_is_parsed() {
         let out = "\n Profile          Model                        Gateway\n ───────────────    ──────────    ─────\n  default         deepseek/deepseek-v4-flash   running\n ◆orchestrator    z-ai/glm-5.3-flash           running\n  coder           —                            stopped\n\n ⚠  Profile 'talos' shares its buzz credential with default\n";
-        let expected = Profiles { names: vec!["default".into(), "orchestrator".into(), "coder".into()], active: Some("orchestrator".into()) };
+        let expected = Profiles { names: vec!["default".into(), "orchestrator".into(), "coder".into()], gateway_default: Some("orchestrator".into()) };
         assert_eq!(parse_profile_list(out), expected);
         assert_eq!(parse_profile_list(&out.replace("◆orchestrator", "◆ orchestrator")), expected);
     }
@@ -188,9 +188,9 @@ mod tests {
     fn dashboard_profiles() {
         let list = json!({ "profiles": [{ "name": "default" }, { "name": "orchestrator" }, { "name": "Bad Name" }] });
         let got = from_dashboard(&list, &json!({ "active": "orchestrator", "current": "default" }));
-        assert_eq!(got, Profiles { names: vec!["default".into(), "orchestrator".into()], active: Some("orchestrator".into()) });
+        assert_eq!(got, Profiles { names: vec!["default".into(), "orchestrator".into()], gateway_default: Some("orchestrator".into()) });
         // A sticky default this gateway doesn't list is not offered as the start Profile.
-        assert_eq!(from_dashboard(&list, &json!({ "active": "gone" })).active, None);
+        assert_eq!(from_dashboard(&list, &json!({ "active": "gone" })).gateway_default, None);
     }
 
     #[test]

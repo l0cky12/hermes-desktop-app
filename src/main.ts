@@ -877,16 +877,16 @@ async function refreshSessions() {
 
 /** Fills the Profile selector and opens this connection's starting Profile. */
 async function setupProfiles() {
-  let list: { names: string[]; active: string | null };
+  let list: { names: string[]; gateway_default: string | null };
   try {
     list = await invoke("list_profiles");
   } catch (e) {
     ui!.sessionsError.textContent = `Couldn't list profiles: ${asError(e).message}`;
-    list = { names: ["default"], active: null };
+    list = { names: ["default"], gateway_default: null };
   }
   if (!list.names.length) list.names = ["default"];
   ui!.profile.replaceChildren(...list.names.map((n) => h("option", { value: n, textContent: n })));
-  const start = startProfile(localStorage, connection, list.names, list.active);
+  const start = startProfile(localStorage, connection, list.names, list.gateway_default);
   await useProfile(start, start === "default" || !list.names.includes("default") ? null : "default");
 }
 

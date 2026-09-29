@@ -423,7 +423,7 @@ async fn list_profiles(state: State<'_, AppState>) -> Result<picker::Profiles, E
         let profiles = acp::list_profiles(&host).await?;
         // Plain `hermes acp` (no Profile picked yet) runs the Gateway's default, so picking that
         // one next doesn't restart Hermes.
-        state.lock().profile.get_or_insert_with(|| profiles.active.clone().unwrap_or_else(|| "default".into()));
+        state.lock().profile.get_or_insert_with(|| profiles.gateway_default.clone().unwrap_or_else(|| "default".into()));
         return Ok(profiles);
     }
     let get = |path: &'static [&'static str]| state.dashboard(Method::GET, path, &[]);
