@@ -3,6 +3,7 @@
 //! is a secret, and the remote Hermes owns all Session state.
 
 use crate::gateway::Error;
+use crate::picker::{parse_profile_list, Profiles};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -15,11 +16,17 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const HOME_MARK: &str = "hermes-desktop-home ";
-/// Prints the remote home (the cwd for new Sessions), then becomes Hermes. The installer puts
-/// `hermes` in ~/.local/bin, which non-interactive SSH shells often leave off PATH.
+/// Makes `hermes` findable: the installer puts it in ~/.local/bin, which non-interactive SSH
+/// shells often leave off PATH.
 // ponytail: POSIX-shell syntax; a fish/nushell login shell needs `ssh host sh -c ...` instead.
-const REMOTE: &str =
-    "printf 'hermes-desktop-home %s\\n' \"$HOME\"; PATH=\"$HOME/.local/bin:$PATH\" exec hermes acp";
+const HERMES: &str = "PATH=\"$HOME/.local/bin:$PATH\" exec hermes";
+
+/// Prints the remote home (the cwd for new Sessions), then becomes Hermes for the given Profile.
+/// `profile` has passed `picker::valid_profile`, which is what makes it safe in this command.
+fn remote(profile: Option<&str>) -> String {
+    let args = profile.map(|p| format!("-p {p} acp")).unwrap_or_else(|| "acp".into());
+    format!("printf 'hermes-desktop-home %s\\n' \"$HOME\"; {HERMES} {args}")
+}
 
 /// Accepts `host`, `user@host`, or an ssh_config alias. Anything that ssh could read as an
 /// option, or that splits into several arguments, is refused.
@@ -56,12 +63,12 @@ pub struct Conn {
 }
 
 /// Starts `ssh host hermes acp` and completes the ACP handshake.
-pub async fn connect(host: &str) -> Result<Arc<Conn>, Error> {
+pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Error> {
     // Tests point this at a shim that runs the remote command locally (see mock/fake-ssh).
     let ssh = std::env::var_os("HERMES_DESKTOP_SSH").unwrap_or_else(|| "ssh".into());
     let mut child = Command::new(ssh)
         // BatchMode: no password or host-key prompt nobody could answer; keys or ssh-agent only.
-        .args(["-T", "-o", "BatchMode=yes", "--", host, REMOTE])
+        .args(["-T", "-o", "BatchMode=yes", "--", host, &remote(profile)])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -97,6 +104,24 @@ pub async fn connect(host: &str) -> Result<Arc<Conn>, Error> {
     let init = json!({ "protocolVersion": 1, "clientCapabilities": {}, "clientInfo": client });
     conn.request("initialize", init).await?;
     Ok(conn)
+}
+
+/// `hermes profile list` on the host (a second, short SSH call), parsed.
+pub async fn list_profiles(host: &str) -> Result<Profiles, Error> {
+    let ssh = std::env::var_os("HERMES_DESKTOP_SSH").unwrap_or_else(|| "ssh".into());
+    let mut command = Command::new(ssh);
+    command
+        .args(["-T", "-o", "BatchMode=yes", "--", host, &format!("{HERMES} profile list")])
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .map_err(|_| Error::Unreachable(format!("No answer from {host} within 30 s")))?
+        .map_err(|e| Error::Unreachable(format!("Could not run ssh: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Unreachable(exited(String::from_utf8_lossy(&out.stderr).into_owned())));
+    }
+    Ok(parse_profile_list(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// The last few stderr lines: ssh's own errors, or why Hermes stopped.
@@ -355,7 +380,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn lists_and_loads_sessions_from_real_hermes() {
-        let conn = connect("localhost").await.unwrap();
+        let conn = connect("localhost", None).await.unwrap();
         assert!(conn.home.starts_with('/'));
         let page = conn.request("session/list", json!({})).await.unwrap();
         let first = &page["sessions"][0];

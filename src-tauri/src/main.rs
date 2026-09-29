@@ -36,6 +36,9 @@ struct Creds {
     api_url: String,
     api_key: Option<String>,
     cookies: BTreeMap<String, String>,
+    /// Named Profiles' own API keys; `api_key` is the default Profile's.
+    #[serde(default)]
+    profile_keys: BTreeMap<String, String>,
 }
 
 #[derive(PartialEq)]
@@ -52,6 +55,33 @@ struct Inner {
     creds: Creds,
     keyring: bool,
     run_stop: bool,
+    /// The Profile this app is showing (already `picker::valid_profile`); `None` until the chat
+    /// view picks one. Over SSH, `None` runs plain `hermes acp`, meaning the Gateway's default.
+    profile: Option<String>,
+}
+
+impl Inner {
+    fn named_profile(&self) -> Option<&str> {
+        self.profile.as_deref().filter(|p| *p != "default")
+    }
+
+    fn api_key(&self) -> Option<&str> {
+        match self.named_profile() {
+            Some(p) => self.creds.profile_keys.get(p).map(String::as_str),
+            None => self.creds.api_key.as_deref(),
+        }
+    }
+
+    /// Replaces the current Profile's API key, returning the old one (for rollback).
+    fn replace_key(&mut self, key: Option<String>) -> Option<String> {
+        match self.named_profile().map(str::to_owned) {
+            Some(p) => match key {
+                Some(k) => self.creds.profile_keys.insert(p, k),
+                None => self.creds.profile_keys.remove(&p),
+            },
+            None => std::mem::replace(&mut self.creds.api_key, key),
+        }
+    }
 }
 
 struct AppState {
@@ -77,22 +107,26 @@ impl AppState {
     }
 
     /// Dashboard request; the sign-in cookie is only ever attached here.
-    fn dashboard(&self, method: Method, path: &[&str]) -> Result<RequestBuilder, Error> {
+    fn dashboard(&self, method: Method, path: &[&str], query: &[(&str, &str)]) -> Result<RequestBuilder, Error> {
         let inner = self.lock();
         let gateway = inner.gateway.as_ref().ok_or_else(not_configured)?;
-        let request = self.client.request(method, endpoint(&gateway.dashboard, path));
+        let mut url = endpoint(&gateway.dashboard, path);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        let request = self.client.request(method, url);
         Ok(match inner.creds.cookies.is_empty() {
             true => request,
             false => request.header(header::COOKIE, cookie_header(&inner.creds.cookies)),
         })
     }
 
-    /// API server request; the API key is only ever attached here.
+    /// API server request for the current Profile; its API key is only ever attached here.
     fn api(&self, method: Method, path: &[&str], query: &[(&str, &str)]) -> Result<RequestBuilder, Error> {
         let inner = self.lock();
         let gateway = inner.gateway.as_ref().ok_or_else(not_configured)?;
-        let key = inner.creds.api_key.as_deref().ok_or_else(|| Error::Unauthorized("No API key saved".into()))?;
-        let mut url = endpoint(&gateway.api, path);
+        let key = inner.api_key().ok_or_else(|| Error::Unauthorized("No API key saved for this profile".into()))?;
+        let mut url = endpoint(&gateway.api, &picker::api_segments(inner.profile.as_deref(), path));
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
         }
@@ -125,8 +159,11 @@ impl AppState {
         if let Some(conn) = slot.as_ref().filter(|c| c.alive()) {
             return Ok(conn.clone());
         }
-        let host = self.lock().ssh_host.clone().ok_or_else(not_configured)?;
-        let conn = acp::connect(&host).await?;
+        let (host, profile) = {
+            let inner = self.lock();
+            (inner.ssh_host.clone().ok_or_else(not_configured)?, inner.profile.clone())
+        };
+        let conn = acp::connect(&host, profile.as_deref()).await?;
         *slot = Some(conn.clone());
         Ok(conn)
     }
@@ -184,7 +221,7 @@ fn load_creds() -> (Option<Creds>, bool) {
 fn save_creds(creds: Creds) -> bool {
     let result = bounded(move || {
         let entry = keyring_entry()?;
-        if creds.api_key.is_none() && creds.cookies.is_empty() {
+        if creds.api_key.is_none() && creds.cookies.is_empty() && creds.profile_keys.is_empty() {
             match entry.delete_credential() {
                 Err(keyring::Error::NoEntry) => Ok(()),
                 other => other,
@@ -260,6 +297,7 @@ async fn configure(state: State<'_, AppState>, dashboard_url: String, api_url: S
         let changed = inner.gateway.as_ref() != Some(&gateway);
         inner.ssh_host = None;
         if changed {
+            inner.profile = None;
             inner.creds = Creds {
                 dashboard_url: gateway.dashboard.to_string(),
                 api_url: gateway.api.to_string(),
@@ -283,7 +321,7 @@ struct Status {
 
 #[tauri::command]
 async fn status(state: State<'_, AppState>) -> Result<Status, Error> {
-    let body = json_body(send(&state.client, state.dashboard(Method::GET, &["api", "status"])?).await?).await?;
+    let body = json_body(send(&state.client, state.dashboard(Method::GET, &["api", "status"], &[])?).await?).await?;
     let auth_required = body["auth_required"]
         .as_bool()
         .ok_or_else(|| Error::Invalid("Not a Hermes dashboard: /api/status has no auth_required".into()))?;
@@ -298,7 +336,7 @@ async fn status(state: State<'_, AppState>) -> Result<Status, Error> {
 #[tauri::command]
 async fn sign_in(state: State<'_, AppState>, username: String, password: String) -> Result<bool, Error> {
     let body = json!({ "provider": "basic", "username": username, "password": password });
-    let request = state.dashboard(Method::POST, &["auth", "password-login"])?.json(&body);
+    let request = state.dashboard(Method::POST, &["auth", "password-login"], &[])?.json(&body);
     let response = send(&state.client, request).await?;
     absorb_cookies(&mut state.lock().creds.cookies, response.headers());
     Ok(state.persist().await)
@@ -307,7 +345,7 @@ async fn sign_in(state: State<'_, AppState>, username: String, password: String)
 /// Confirms the sign-in cookie via `/api/auth/me`, keeping any rotated cookies it hands back.
 #[tauri::command]
 async fn check_sign_in(state: State<'_, AppState>) -> Result<String, Error> {
-    match send(&state.client, state.dashboard(Method::GET, &["api", "auth", "me"])?).await {
+    match send(&state.client, state.dashboard(Method::GET, &["api", "auth", "me"], &[])?).await {
         Ok(response) => {
             state.absorb(&response).await;
             Ok(json_body(response).await?["display_name"].as_str().unwrap_or_default().to_owned())
@@ -340,11 +378,11 @@ struct KeyAccepted {
 /// Keeps the key only if `/v1/capabilities` accepts it.
 #[tauri::command]
 async fn set_api_key(state: State<'_, AppState>, key: String) -> Result<KeyAccepted, Error> {
-    let previous = state.lock().creds.api_key.replace(key.trim().to_owned());
+    let previous = state.lock().replace_key(Some(key.trim().to_owned()));
     match capabilities(state.clone()).await {
         Ok(runs) => Ok(KeyAccepted { runs, saved: state.persist().await }),
         Err(e) => {
-            state.lock().creds.api_key = previous;
+            state.lock().replace_key(previous);
             Err(e)
         }
     }
@@ -370,6 +408,7 @@ async fn configure_ssh(state: State<'_, AppState>, host: String) -> Result<(), E
         inner.gateway = None;
         inner.creds = Creds::default();
         inner.ssh_host = Some(host.clone());
+        inner.profile = None;
     }
     state.hermes.lock().await.take();
     state.persist().await;
@@ -380,6 +419,32 @@ async fn configure_ssh(state: State<'_, AppState>, host: String) -> Result<(), E
 #[tauri::command]
 async fn connect_ssh(state: State<'_, AppState>) -> Result<(), Error> {
     state.hermes().await.map(drop)
+}
+
+/// Profiles to offer, and the Gateway's default Profile, which this app never changes.
+#[tauri::command]
+async fn list_profiles(state: State<'_, AppState>) -> Result<picker::Profiles, Error> {
+    if state.ssh() {
+        let host = state.lock().ssh_host.clone().ok_or_else(not_configured)?;
+        return acp::list_profiles(&host).await;
+    }
+    let get = |path: &'static [&'static str]| state.dashboard(Method::GET, path, &[]);
+    let list = json_body(send(&state.client, get(&["api", "profiles"])?).await?).await?;
+    let active = json_body(send(&state.client, get(&["api", "profiles", "active"])?).await?).await?;
+    Ok(picker::from_dashboard(&list, &active))
+}
+
+/// Switches Profile. Over HTTP, later requests go to `/p/<name>/` with that Profile's own key;
+/// over SSH, Hermes restarts as `hermes -p <name> acp`.
+#[tauri::command]
+async fn set_profile(state: State<'_, AppState>, name: String) -> Result<(), Error> {
+    let name = picker::valid_profile(&name)?;
+    let changed = state.lock().profile.replace(name.clone()) != Some(name);
+    if changed && state.ssh() {
+        state.hermes.lock().await.take();
+        state.acp_runs.lock().unwrap().clear();
+    }
+    Ok(())
 }
 
 /// Answers an Approval request from Hermes over SSH; `None` denies by cancelling.
@@ -680,6 +745,8 @@ fn main() {
             finish_pairing,
             configure_ssh,
             connect_ssh,
+            list_profiles,
+            set_profile,
             answer_permission,
             list_sessions,
             session_messages,
@@ -690,4 +757,31 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hermes Desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_profile_keeps_its_own_key() {
+        let mut inner = Inner { creds: Creds { api_key: Some("root".into()), ..Creds::default() }, ..Inner::default() };
+        inner.profile = Some("coder".into());
+        assert_eq!(inner.api_key(), None, "never falls back to the default Profile's key");
+        assert_eq!(inner.replace_key(Some("c".into())), None);
+        assert_eq!(inner.api_key(), Some("c"));
+        inner.profile = Some("default".into());
+        assert_eq!(inner.api_key(), Some("root"));
+        inner.profile = Some("coder".into());
+        assert_eq!(inner.replace_key(None), Some("c".into()), "rollback of a rejected key");
+        assert_eq!(inner.creds.api_key.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn keyring_entries_from_before_profiles_still_load() {
+        let old = r#"{"dashboard_url":"http://h:9119/","api_url":"http://h:8642/","api_key":"k","cookies":{}}"#;
+        let creds: Creds = serde_json::from_str(old).unwrap();
+        assert_eq!(creds.api_key.as_deref(), Some("k"));
+        assert!(creds.profile_keys.is_empty());
+    }
 }
