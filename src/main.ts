@@ -341,6 +341,7 @@ let ui: {
   menu: HTMLElement;
   reasoning: HTMLSelectElement;
   mic: HTMLButtonElement;
+  paperclip: HTMLButtonElement;
   micTime: HTMLElement;
 } | null = null;
 
@@ -361,6 +362,7 @@ function showChat(supported: boolean, ssh = false) {
     spacer: h("span", { className: "spacer" }),
     mic: h("button", { type: "button", className: "icon-btn", title: "Dictate" }),
     micTime: h("span"),
+    paperclip: h("button", { type: "button", className: "icon-btn", title: "Attach files" }, icon("paperclip")),
     profile: h("select", { title: "Profile" }),
     modelPicker: h("span", { className: "picker model" }),
     modelLabel: h("span"),
@@ -374,9 +376,8 @@ function showChat(supported: boolean, ssh = false) {
     await addFiles([...(picker.files ?? [])]);
     picker.value = "";
   };
-  const paperclip = h("button", { type: "button", className: "icon-btn", title: "Attach files", onclick: () => picker.click() }, icon("paperclip"));
-  paperclip.disabled = !runs;
-  ui.toolbar.append(paperclip, picker, ui.spacer, button);
+  ui.paperclip.onclick = () => picker.click();
+  ui.toolbar.append(ui.paperclip, picker, ui.spacer, button);
   ui.mic.append(icon("mic"), ui.micTime);
   ui.mic.onclick = () => void toggleDictation();
   // Speech-to-text is a Dashboard feature; over SSH there is no Dashboard.
@@ -412,6 +413,7 @@ function showChat(supported: boolean, ssh = false) {
       ui.drop,
     ),
   );
+  renderPending(); // puts the composer error line on screen
   newChat();
   updateComposer();
   void setupProfiles();
@@ -563,6 +565,7 @@ function updateComposer() {
   ui!.send.textContent = active ? "Stop" : "Send";
   ui!.send.disabled = !runs || (active !== null && !active.runId);
   ui!.input.disabled = !runs;
+  ui!.paperclip.disabled = !runs;
 }
 
 const FENCE = /```(?:[^\n`]*\n)?([\s\S]*?)```/;
@@ -796,7 +799,7 @@ function newChat() {
   leave();
   sessionId = null;
   choice = DEFAULT_CHOICE;
-  lastChoice = undefined;
+  lastChoice = DEFAULT_CHOICE; // a choice made before the first message is a change too
   renderChoice();
   ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "New chat. Type a message, or drop files to attach them." }));
   markCurrent();
@@ -905,6 +908,8 @@ async function useProfile(name: string, previous: string | null) {
   ui!.profile.value = name;
   saveProfile(localStorage, connection, name);
   ui!.sessionsError.textContent = "";
+  pending = [];
+  renderPending();
   newChat();
   await Promise.all([refreshSessions(), refreshModels()]);
 }
