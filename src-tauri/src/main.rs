@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use tauri::webview::{PermissionKind, PermissionResponse};
 use tauri::{async_runtime, ipc::Channel, DragDropEvent, Manager, State, WindowEvent};
 
 const KEYRING_SERVICE: &str = "local.hermes-desktop";
@@ -646,7 +647,21 @@ fn main() {
                 hermes: tokio::sync::Mutex::default(),
                 acp_runs: Mutex::default(),
             });
+            #[cfg(target_os = "linux")]
+            if let Some(window) = app.get_webview_window("main") {
+                window.with_webview(|webview| {
+                    use webkit2gtk::{SettingsExt, WebViewExt};
+                    if let Some(settings) = WebViewExt::settings(&webview.inner()) {
+                        settings.set_enable_media_stream(true);
+                    }
+                })?;
+            }
             Ok(())
+        })
+        // Dictation is the only thing that asks; everything else keeps the platform default.
+        .on_permission_request(|_, kind| match kind {
+            PermissionKind::Microphone => PermissionResponse::Allow,
+            _ => PermissionResponse::Default,
         })
         .on_window_event(|window, event| {
             if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
