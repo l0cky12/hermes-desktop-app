@@ -1,5 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { field, h, input } from "./dom";
+import { applyAppearance } from "./appearance";
 
 type GatewayError = { kind: "unreachable" | "unauthorized" | "not_found" | "http" | "invalid"; message: string };
 type Init = { dashboard_url: string | null; api_url: string | null; ssh_host: string | null; keyring: boolean };
@@ -25,28 +27,11 @@ interface Turn {
   statusEl: HTMLElement;
 }
 
+applyAppearance();
 const app = document.querySelector<HTMLDivElement>("#app")!;
 const banner = document.querySelector<HTMLDivElement>("#banner")!;
 const dialog = document.querySelector<HTMLDialogElement>("#reauth")!;
 dialog.addEventListener("cancel", (e) => e.preventDefault()); // re-auth can't be dismissed, only completed
-
-function h<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  props: Partial<HTMLElementTagNameMap[K]> = {},
-  ...children: (Node | string)[]
-): HTMLElementTagNameMap[K] {
-  const el = Object.assign(document.createElement(tag), props);
-  el.append(...children);
-  return el;
-}
-
-function input(props: Partial<HTMLInputElement>): HTMLInputElement {
-  return h("input", { required: true, spellcheck: false, autocomplete: "off", ...props });
-}
-
-function field(label: string, control: HTMLElement): HTMLLabelElement {
-  return h("label", {}, h("span", { textContent: label }), control);
-}
 
 const asError = (e: unknown): GatewayError =>
   typeof e === "object" && e !== null && "kind" in e ? (e as GatewayError) : { kind: "invalid", message: String(e) };
