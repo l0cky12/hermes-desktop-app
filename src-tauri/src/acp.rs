@@ -66,17 +66,21 @@ pub struct Conn {
     _child: Child,
 }
 
+/// `ssh host <command>`. `host` has passed `valid_host`.
+fn ssh(host: &str, command: &str) -> Command {
+    // Tests point this at a shim that runs the remote command locally (see mock/fake-ssh).
+    let mut ssh = Command::new(std::env::var_os("HERMES_DESKTOP_SSH").unwrap_or_else(|| "ssh".into()));
+    // BatchMode: no password or host-key prompt nobody could answer; keys or ssh-agent only.
+    ssh.args(["-T", "-o", "BatchMode=yes", "--", host, command]).kill_on_drop(true);
+    ssh
+}
+
 /// Starts `ssh host hermes acp` and completes the ACP handshake.
 pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Error> {
-    // Tests point this at a shim that runs the remote command locally (see mock/fake-ssh).
-    let ssh = std::env::var_os("HERMES_DESKTOP_SSH").unwrap_or_else(|| "ssh".into());
-    let mut child = Command::new(ssh)
-        // BatchMode: no password or host-key prompt nobody could answer; keys or ssh-agent only.
-        .args(["-T", "-o", "BatchMode=yes", "--", host, &remote(profile)])
+    let mut child = ssh(host, &remote(profile))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
         .spawn()
         .map_err(|e| Error::Unreachable(format!("Could not run ssh: {e}")))?;
     let stderr = tokio::spawn(tail(BufReader::new(child.stderr.take().expect("piped")).lines()));
@@ -114,12 +118,8 @@ pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Err
 
 /// `hermes profile list` on the host (a second, short SSH call), parsed.
 pub async fn list_profiles(host: &str) -> Result<Profiles, Error> {
-    let ssh = std::env::var_os("HERMES_DESKTOP_SSH").unwrap_or_else(|| "ssh".into());
-    let mut command = Command::new(ssh);
-    command
-        .args(["-T", "-o", "BatchMode=yes", "--", host, &format!("{HERMES} profile list")])
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+    let mut command = ssh(host, &format!("{HERMES} profile list"));
+    command.stdin(Stdio::null());
     let out = tokio::time::timeout(Duration::from_secs(30), command.output())
         .await
         .map_err(|_| Error::Unreachable(format!("No answer from {host} within 30 s")))?
