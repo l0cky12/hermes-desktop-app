@@ -42,8 +42,12 @@ _Avoid_: login error, auth error
 
 ### Conversation
 
+**Profile**:
+A named Hermes configuration with its own Sessions, API key, default model, and skills; the app shows one Profile at a time and never changes the Gateway's own default Profile.
+_Avoid_: account, persona, agent
+
 **Session**:
-A conversation transcript stored on the API server; never the Sign-in cookie.
+A conversation transcript stored on the API server under one Profile; never the Sign-in cookie.
 _Avoid_: chat, thread, conversation
 
 **Turn**:
@@ -54,9 +58,21 @@ _Avoid_: message, exchange
 One server-side execution that produces a reply; a Turn is backed by one Run, or more after Retry.
 _Avoid_: job, request, completion
 
+**Model choice**:
+The provider and model that a Session's next Turns run on; "Profile default" until the user picks one, and changeable mid-Session.
+_Avoid_: engine, LLM
+
+**Reasoning level**:
+How much the model reasons before replying, chosen per Session; "Default" follows the Profile.
+_Avoid_: effort, thinking mode
+
 **Attachment**:
-A dropped file carried inside the Run request of the Turn it was dropped onto.
+A file (dropped, picked with the paperclip, or a pasted image) carried inside the Run request of the Turn it was added to.
 _Avoid_: upload, file
+
+**Dictation**:
+Speaking into the microphone to fill the message box with text the user can edit before sending.
+_Avoid_: voice mode, TTS
 
 **Retry**:
 Recovering a failed, stopped, or not-sent Turn: reattaching to its Run's event stream where it left off, or starting a new Run with the same input in the same Session when that Run is gone.
@@ -67,5 +83,19 @@ Closing a Turn's event stream at once and asking the API server to stop its Run.
 _Avoid_: cancel, abort
 
 **Approval request**:
-A Run pausing until a human allows or denies a risky command; this client shows it but cannot answer it.
+A Run pausing until a human allows or denies a risky command; this client can answer it only over SSH.
 _Avoid_: permission prompt, confirmation
+
+### Appearance
+
+**Appearance settings**:
+This machine's look for the app, the same whichever Gateway it connects to.
+_Avoid_: preferences, config
+
+**Theme**:
+The light or dark base colors (or follow the system).
+_Avoid_: mode, color scheme
+
+**Skin**:
+An accent palette layered on top of either Theme.
+_Avoid_: theme, color scheme
