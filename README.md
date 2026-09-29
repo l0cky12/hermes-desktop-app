@@ -2,15 +2,30 @@
 
 A small Tauri client for a self-hosted Hermes Agent gateway: pairing and sign-in, streaming chat with tool progress and Stop, a Sessions panel, and drag-and-drop attachments. Vocabulary is in [CONTEXT.md](CONTEXT.md).
 
-## Build and run
+## Install on Arch Linux
 
-System packages (Tauri 2 on Linux):
+Either install a prebuilt package or build one on the PC. Both install through pacman, and you remove them with `sudo pacman -R hermes-desktop`.
+
+- **Prebuilt:** copy `packaging/arch/hermes-desktop-*.pkg.tar.zst` to the PC and run `sudo pacman -U hermes-desktop-*.pkg.tar.zst`. pacman pulls in the runtime dependencies. The file isn't committed to git; rebuild it with the command below.
+- **From source:** get the repo onto the PC, for example with `git clone` over SSH, then:
+
+  ```sh
+  sudo pacman -S --needed base-devel git
+  cd hermes-desktop/packaging/arch && makepkg -si   # builds the committed checkout (~5 min)
+  ```
+
+  To update later, run `git pull` and `makepkg -si` again.
+
+This adds **Hermes Desktop** to the app menu (`/usr/bin/hermes-desktop`).
+- **Credentials:** saving them needs a Secret Service keyring. GNOME and KDE (KWallet) provide one. On other desktops, install `gnome-keyring`. Without one, the app still works, but asks you to sign in on every launch.
+- **Blank window with NVIDIA drivers:** a known WebKitGTK workaround is to start it as `WEBKIT_DISABLE_DMABUF_RENDERER=1 hermes-desktop`.
+
+## Build and run (development)
+
+System packages on Debian or Ubuntu (on Arch, `makepkg -s` installs them):
 
 ```sh
-# Debian / Ubuntu
 sudo apt install libwebkit2gtk-4.1-dev build-essential pkg-config curl wget file libxdo-dev libssl-dev librsvg2-dev
-# Arch
-sudo pacman -S --needed webkit2gtk-4.1 base-devel curl wget file openssl librsvg xdotool
 ```
 
 Then, with Node 20+ and a stable Rust toolchain:
