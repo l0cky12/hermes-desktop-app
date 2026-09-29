@@ -1,6 +1,6 @@
 # Hermes Desktop
 
-A small Tauri client for a self-hosted Hermes Agent gateway: pairing and sign-in, streaming chat with tool progress and Stop, a Sessions panel, and drag-and-drop attachments. Vocabulary is in [CONTEXT.md](CONTEXT.md).
+A small Tauri client for a self-hosted Hermes Agent gateway: pairing and sign-in, streaming chat with tool progress and Stop, a Sessions panel, Profile, model, and Reasoning level pickers, Dictation, drag-and-drop, picked, and pasted attachments, and Appearance settings. Vocabulary is in [CONTEXT.md](CONTEXT.md).
 
 ## Install on Arch Linux
 
@@ -35,6 +35,7 @@ npm install
 npm run tauri dev                    # development window
 npm run tauri build -- --no-bundle   # release binary: src-tauri/target/release/hermes-desktop
 (cd src-tauri && cargo test)         # SSE parser, URL validation, cookie jar, attachments
+npm test                             # webview preferences (Node 22.18+)
 ```
 
 ## Pairing
@@ -47,10 +48,28 @@ Under **Or run Hermes over SSH**, enter a host (`host`, `user@host`, or an `~/.s
 
 Over SSH, the app can answer Approval requests. Sessions can't be deleted, and a dropped connection can't be reattached, so Retry starts a new Run in the same Session.
 
+## Profiles, models, and reasoning
+
+The bar under the message box picks the **Profile** (person icon), model (CPU icon), and Reasoning level (brain icon).
+
+- Switching Profile shows that Profile's Sessions and starts a new chat.
+- The app opens on the Profile you last used, or on the Gateway's default Profile (`hermes profile use`). It never changes that default itself.
+- Over HTTP, a named Profile is reached at `/p/<name>/…` and needs its own `API_SERVER_KEY` (from that Profile's `.env`). The app asks for it the first time and keeps it in the keyring.
+- Over SSH, switching restarts Hermes as `hermes -p <name> acp`.
+- The model list shows only providers you've set up.
+- The model and Reasoning level belong to each Session, can change partway through it, and take effect from the next Turn. A small label marks the first reply after a change.
+- Over SSH, the Reasoning level comes from the Profile's config and can't be changed here.
+
+## Dictation
+
+The microphone records until you click it again, or for up to 2 minutes. The Dashboard's speech-to-text (`POST /api/audio/transcribe`) then turns the recording into text, which is inserted at the cursor for you to edit. This uses the Profile's own voice settings. It isn't available over SSH.
+
 ## Where things are stored
 
 - `~/.config/local.hermes-desktop/settings.json` holds the two gateway URLs, or the SSH host. It never holds secrets.
 - The API key and sign-in cookie are stored as one entry in the OS keyring: Secret Service on Linux, Keychain on macOS, Credential Manager on Windows. That entry is bound to the gateway URLs it was issued for.
+- Named Profiles' API keys are stored in that same keyring entry.
+- The webview's own storage holds Appearance settings (Theme, Skin, Font size), the last Profile used on each connection, and each Session's model and Reasoning level. It never holds credentials.
 - **Keyring fallback:** if the keyring is missing, locked, or doesn't answer within 10 s (headless machines, CI), the app says so in a banner. Credentials then stay in memory for that run only, and it asks for them again on the next launch. It never falls back to a plaintext file.
 - Logs go to stderr and contain request method, path, and status only.
 
@@ -58,10 +77,11 @@ Every request goes directly to the configured gateway: system proxies are ignore
 
 ## Attachments
 
-The API server has no upload endpoint, so dropped files ride inside the Run request.
+The API server has no upload endpoint, so Attachments ride inside the Run request. Drop files on the window, pick them with the paperclip, or paste an image.
 - Text files are inlined as fenced text.
 - Images (`png`, `jpg`, `gif`, `webp`) are sent as `image_url` data-URL parts.
 - Other file types, and files over 2 MB, are refused with an inline "Not sent" error.
+- Pasted images over 2 MB, or in a format that can't be sent, are re-encoded as JPEG and scaled down until they fit.
 
 ## Testing against the mock gateway
 
@@ -71,6 +91,8 @@ The API server has no upload endpoint, so dropped files ride inside the Run requ
 node mock/server.mjs   # Dashboard :19119, API server :18642
                        # user tester / correct-horse-battery, key hd-test-key-4f9c2a7e1b
 ```
+
+Profiles: `default` (the key above), `orchestrator` (`hd-orch-key-7d3e9a1c5b`), and `coder` (no key, so switching to it is refused). Replies start with `[profile · model · reasoning]` so you can see what a Run was sent with. `MOCK_NO_MODELS=1` makes the model list fail; `MOCK_TRANSCRIBE_MS` delays speech-to-text.
 
 Prompt keywords script the reply:
 - `tool`: tool events
