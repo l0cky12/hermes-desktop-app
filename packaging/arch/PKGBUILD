@@ -1,0 +1,46 @@
+# Builds Hermes Desktop from the committed state of the git checkout this file lives in:
+#   cd packaging/arch && makepkg -si
+pkgname=hermes-desktop
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Thin desktop client for a self-hosted Hermes Agent gateway'
+arch=('x86_64')
+license=('unknown')
+depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'glib2' 'cairo' 'gdk-pixbuf2' 'dbus' 'gcc-libs' 'glibc')
+makedepends=('git' 'rust' 'nodejs' 'npm')
+optdepends=('gnome-keyring: Secret Service keyring for saving credentials (KWallet or KeePassXC also work)')
+options=('!lto') # makepkg's LTO flags break the C code built by Rust crates (aws-lc-sys)
+source=("$pkgname::git+file://${startdir%/packaging/arch}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$pkgname"
+  npm ci
+  npm run tauri build -- --no-bundle
+}
+
+check() {
+  cd "$pkgname/src-tauri"
+  cargo test --release
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 src-tauri/target/release/hermes-desktop "$pkgdir/usr/bin/hermes-desktop"
+  install -Dm644 src-tauri/icons/icon.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/hermes-desktop.png"
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/hermes-desktop.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Hermes Desktop
+Comment=Chat with your Hermes Agent gateway
+Exec=hermes-desktop
+Icon=hermes-desktop
+Categories=Network;Chat;
+Terminal=false
+EOF
+}
