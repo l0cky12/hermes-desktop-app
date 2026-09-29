@@ -6,6 +6,7 @@ import {
   changeLabel, choiceKey, DEFAULT_CHOICE, loadChoice, REASONING_LEVELS, saveChoice, saveProfile, startProfile,
   type Choice, type ModelChoice,
 } from "./prefs";
+import { transcriptMarkdown } from "./transcript";
 
 type GatewayError = { kind: "unreachable" | "unauthorized" | "not_found" | "http" | "invalid"; message: string };
 type Init = { dashboard_url: string | null; api_url: string | null; ssh_host: string | null; keyring: boolean };
@@ -323,6 +324,7 @@ let signInRequired = true; // the Dashboard asks for Sign-in; without it, a 401 
 let overSsh = false; // Hermes over SSH (hermes acp): Approvals can be answered, Sessions can't be deleted
 let sessionId: string | null = null;
 let active: Turn | null = null;
+let turns: Turn[] = []; // the open Session's Turns, in order
 let pending: Attachment[] = [];
 let models: Models = { default: null, groups: [] };
 let choice: Choice = DEFAULT_CHOICE; // what the next Turn in this view runs on
@@ -346,6 +348,8 @@ let ui: {
   mic: HTMLButtonElement;
   paperclip: HTMLButtonElement;
   micTime: HTMLElement;
+  copy: HTMLButtonElement;
+  copied: HTMLElement;
 } | null = null;
 
 function showChat(supported: boolean, ssh = false) {
@@ -366,6 +370,8 @@ function showChat(supported: boolean, ssh = false) {
     mic: h("button", { type: "button", className: "icon-btn", title: "Dictate" }),
     micTime: h("span"),
     paperclip: h("button", { type: "button", className: "icon-btn", title: "Add attachments" }, icon("paperclip")),
+    copy: h("button", { type: "button", className: "icon-btn", title: "Copy Session as Markdown" }),
+    copied: h("span"),
     profile: h("select", { title: "Profile" }),
     modelPicker: h("span", { className: "picker model" }),
     modelLabel: h("span"),
@@ -398,6 +404,9 @@ function showChat(supported: boolean, ssh = false) {
   ui.reasoning.onchange = () => setChoice({ ...choice, reasoning: ui!.reasoning.value || null });
   ui.toolbar.insertBefore(ui.modelPicker, ui.spacer);
   ui.toolbar.insertBefore(reasoningPicker, ui.spacer);
+  ui.copy.append(icon("copy"), ui.copied);
+  ui.copy.onclick = () => void copySession();
+  ui.toolbar.insertBefore(ui.copy, ui.spacer);
   box.onkeydown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -569,6 +578,19 @@ function updateComposer() {
   ui!.send.disabled = !runs || (active !== null && !active.runId);
   ui!.input.disabled = !runs;
   ui!.paperclip.disabled = !runs;
+  ui!.copy.disabled = !turns.length;
+}
+
+/** Copies every Turn of the open Session, as the chat view shows it, to the clipboard. */
+async function copySession() {
+  await navigator.clipboard.writeText(transcriptMarkdown(turns.map((t) => ({
+    text: t.text,
+    attachments: t.files.map(attachmentName),
+    tools: [...t.tools.querySelectorAll<HTMLElement>(".tool")].map((c) => c.dataset.tool!),
+    reply: t.reply,
+  }))));
+  ui!.copied.textContent = "Copied";
+  setTimeout(() => (ui!.copied.textContent = ""), 1500);
 }
 
 const FENCE = /```(?:[^\n`]*\n)?([\s\S]*?)```/;
@@ -617,6 +639,8 @@ function addTurn(text: string, files: Attachment[]): Turn {
   };
   turn.root.append(...(text || files.length ? [user] : []), turn.tools, turn.replyEl, turn.notice, turn.statusEl);
   ui!.turns.append(turn.root);
+  turns.push(turn);
+  updateComposer();
   scrollToEnd();
   return turn;
 }
@@ -804,6 +828,8 @@ function newChat() {
   choice = DEFAULT_CHOICE;
   lastChoice = DEFAULT_CHOICE; // a choice made before the first message is a change too
   renderChoice();
+  turns = [];
+  updateComposer();
   ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "New chat. Type a message, or drop attachments here." }));
   markCurrent();
 }
@@ -815,6 +841,8 @@ async function openSession(id: string) {
   lastChoice = choice;
   renderChoice();
   markCurrent();
+  turns = [];
+  updateComposer();
   ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "Loading…" }));
   try {
     const messages = await invoke<Message[]>("session_messages", { id });

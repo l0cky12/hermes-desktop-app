@@ -1,6 +1,6 @@
 # Hermes Desktop
 
-A small Tauri client for a self-hosted Hermes Agent gateway: pairing and sign-in, streaming chat with tool progress and Stop, a Sessions panel, Profile, model, and Reasoning level pickers, Dictation, drag-and-drop, picked, and pasted attachments, Appearance settings, and, from the icon rail, the Hermes Kanban Board, Skills with on/off toggles, and the Client log. Vocabulary is in [CONTEXT.md](CONTEXT.md).
+A small Tauri client for a self-hosted Hermes Agent gateway: pairing and sign-in, streaming chat with tool progress and Stop, a Sessions panel, copying a whole Session as Markdown, Profile, model, and Reasoning level pickers, Dictation, drag-and-drop, picked, and pasted attachments, Appearance settings, and, from the icon rail, the Hermes Kanban Board, Skills with on/off toggles, and the Client log. Vocabulary is in [CONTEXT.md](CONTEXT.md).
 
 ## Install on Arch Linux
 
@@ -35,7 +35,7 @@ npm install
 npm run tauri dev                    # development window
 npm run tauri build -- --no-bundle   # release binary: src-tauri/target/release/hermes-desktop
 (cd src-tauri && cargo test)         # SSE parser, URL validation, cookie jar, attachments, pickers, SSH quoting, Board/Skills parsing, Client log
-npm test                             # webview preferences (Node 22.18+)
+npm test                             # webview preferences, Session transcript Markdown (Node 22.18+)
 ```
 
 ## Pairing
@@ -68,6 +68,8 @@ The bar under the message box picks the **Profile** (person icon), model (CPU ic
 - The model list shows only providers you've set up.
 - The model and Reasoning level belong to each Session, can change partway through it, and take effect from the next Turn. A small label marks the first reply after a change.
 - Over SSH, the Reasoning level comes from the Profile's config and can't be changed here.
+
+The copy icon in the same bar copies the open Session to the clipboard as Markdown: every Turn's message and reply under **User** and **Hermes** headings, Attachments and tools listed by name. It's greyed out until the Session has a Turn.
 
 ## Dictation
 
