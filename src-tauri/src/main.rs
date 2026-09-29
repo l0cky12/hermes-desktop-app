@@ -539,13 +539,20 @@ async fn start_run(
     state: State<'_, AppState>,
     session_id: Option<String>,
     text: String,
-    files: Vec<PathBuf>,
+    files: Vec<attach::Source>,
     model: Option<picker::ModelChoice>,
     reasoning: Option<String>,
 ) -> Result<RunStarted, Error> {
     let reasoning = reasoning.map(|r| picker::valid_reasoning(&r)).transpose()?;
-    if let Some(stray) = files.iter().find(|f| !state.dropped.lock().unwrap().contains(*f)) {
-        return Err(Error::Invalid(format!("{} was not dropped into this window", stray.display())));
+    let stray = {
+        let dropped = state.dropped.lock().unwrap();
+        files.iter().find_map(|f| match f {
+            attach::Source::Dropped { path } if !dropped.contains(path) => Some(path.display().to_string()),
+            _ => None,
+        })
+    };
+    if let Some(stray) = stray {
+        return Err(Error::Invalid(format!("{stray} was not dropped into this window")));
     }
     let input = attach::build_input(&text, &files).map_err(Error::Invalid)?;
     if state.ssh() {
