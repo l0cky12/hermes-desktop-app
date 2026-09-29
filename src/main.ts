@@ -11,11 +11,12 @@ type RunEvent = { event: string; seq?: number; [field: string]: unknown };
 type StreamMsg = { type: "event"; data: RunEvent } | { type: "dropped"; message: string };
 type Session = { id: string; title?: string | null; preview?: string | null };
 type Message = { role: string; content: unknown; tool_calls?: { function?: { name?: string } }[] | null };
+type Attachment = { path: string } | { name: string; data_url: string };
 type TurnStatus = "streaming" | "done" | "stopped" | "failed" | "not-sent";
 
 interface Turn {
   text: string;
-  files: string[];
+  files: Attachment[];
   runId?: string;
   lastSeq: number;
   reply: string;
@@ -37,6 +38,7 @@ const asError = (e: unknown): GatewayError =>
   typeof e === "object" && e !== null && "kind" in e ? (e as GatewayError) : { kind: "invalid", message: String(e) };
 
 const basename = (path: string) => path.split(/[\\/]/).pop() ?? path;
+const attachmentName = (a: Attachment) => ("path" in a ? basename(a.path) : a.name);
 
 function noteSaved(saved: boolean) {
   if (!saved) {
@@ -304,7 +306,7 @@ let runs = false; // the API server accepts Runs and streams their events
 let overSsh = false; // Hermes over SSH (hermes acp): Approvals can be answered, Sessions can't be deleted
 let sessionId: string | null = null;
 let active: Turn | null = null;
-let pending: string[] = [];
+let pending: Attachment[] = [];
 let ui: {
   sessions: HTMLUListElement;
   sessionsError: HTMLElement;
@@ -313,6 +315,9 @@ let ui: {
   input: HTMLTextAreaElement;
   send: HTMLButtonElement;
   drop: HTMLElement;
+  composerError: HTMLElement;
+  toolbar: HTMLElement;
+  spacer: HTMLElement;
 } | null = null;
 
 function showChat(supported: boolean, ssh = false) {
@@ -324,11 +329,23 @@ function showChat(supported: boolean, ssh = false) {
     sessionsError: h("p", { className: "error" }),
     turns: h("div", { className: "turns" }),
     pending: h("div", { className: "pending" }),
-    input: h("textarea", { placeholder: runs ? "Message Hermes. Drop files to attach." : unavailable, rows: 3 }),
+    input: h("textarea", { placeholder: runs ? "Message Hermes. Drop, paste, or attach files." : unavailable, rows: 3 }),
     send: h("button", { textContent: "Send" }),
     drop: h("div", { className: "drop", hidden: true, textContent: runs ? "Drop files to attach" : unavailable }),
+    composerError: h("p", { className: "error" }),
+    toolbar: h("div", { className: "toolbar" }),
+    spacer: h("span", { className: "spacer" }),
   };
   const { input: box, send: button } = ui;
+  const picker = h("input", { type: "file", multiple: true, hidden: true });
+  picker.onchange = async () => {
+    await addFiles([...(picker.files ?? [])]);
+    picker.value = "";
+  };
+  const paperclip = h("button", { type: "button", className: "icon-btn", title: "Attach files", onclick: () => picker.click() }, icon("paperclip"));
+  paperclip.disabled = !runs;
+  ui.toolbar.append(paperclip, picker, ui.spacer, button);
+  box.onpaste = (e) => void pasteImages(e);
   box.onkeydown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -343,7 +360,7 @@ function showChat(supported: boolean, ssh = false) {
       h("aside", {}, h("div", { className: "row" }, h("h2", { textContent: "Sessions" }),
         h("button", { className: "secondary", textContent: "New chat", onclick: newChat })), ui.sessionsError, ui.sessions,
         h("footer", {}, h("button", { className: "icon-btn", title: "Settings", onclick: showSettings }, icon("settings"), "Settings"))),
-      h("main", {}, ui.turns, ui.pending, h("div", { className: "composer" }, box, button)),
+      h("main", {}, ui.turns, ui.pending, h("div", { className: "composer" }, h("div", { className: "composer-box" }, box, ui.toolbar))),
       ui.drop,
     ),
   );
@@ -370,25 +387,81 @@ getCurrentWebview().onDragDropEvent(({ payload }) => {
   if (!ui) return;
   ui.drop.hidden = payload.type === "drop" || payload.type === "leave";
   if (payload.type === "drop" && runs) {
-    pending.push(...payload.paths.filter((p) => !pending.includes(p)));
+    pending.push(...payload.paths.filter((p) => !pending.some((a) => "path" in a && a.path === p)).map((path) => ({ path })));
     renderPending();
   }
 });
 
+/** An Attachment chip: a thumbnail for images the webview holds, a paperclip otherwise. */
+function chip(a: Attachment, onRemove?: () => void): HTMLElement {
+  const thumb = "data_url" in a && a.data_url.startsWith("data:image/") ? h("img", { src: a.data_url, alt: "" }) : "📎";
+  const remove = onRemove ? [h("button", { className: "link", textContent: "×", title: "Remove attachment", onclick: onRemove })] : [];
+  return h("span", { className: "chip" }, thumb, attachmentName(a), ...remove);
+}
+
 function renderPending() {
   ui!.pending.replaceChildren(
-    ...pending.map((path) =>
-      h("span", { className: "chip" }, `📎 ${basename(path)}`, h("button", {
-        className: "link",
-        textContent: "×",
-        title: "Remove attachment",
-        onclick: () => {
-          pending = pending.filter((p) => p !== path);
-          renderPending();
-        },
-      })),
-    ),
+    ...pending.map((a) => chip(a, () => {
+      pending = pending.filter((p) => p !== a);
+      renderPending();
+    })),
+    ui!.composerError,
   );
+}
+
+const MAX_BYTES = 2 * 1024 * 1024; // attach.rs enforces it; checked here only to avoid reading huge files
+const SENDABLE = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+let pasted = 0;
+
+const dataUrl = (blob: Blob) =>
+  new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+
+async function addFiles(files: File[]) {
+  for (const file of files) {
+    if (file.size > MAX_BYTES) ui!.composerError.textContent = `Not attached: ${file.name} is larger than 2 MB`;
+    else pending.push({ name: file.name, data_url: await dataUrl(file) });
+  }
+  renderPending();
+}
+
+/** Screenshots are often over 2 MB or an unsendable type: re-encode as JPEG, shrinking until one fits. */
+async function fitImage(blob: Blob): Promise<Blob> {
+  if (blob.size <= MAX_BYTES && SENDABLE.includes(blob.type)) return blob;
+  const bitmap = await createImageBitmap(blob);
+  for (const scale of [1, 0.75, 0.5, 0.35]) {
+    const canvas = h("canvas", { width: Math.round(bitmap.width * scale), height: Math.round(bitmap.height * scale) });
+    const ctx = canvas.getContext("2d")!;
+    ctx.fillStyle = "#fff"; // JPEG has no transparency
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const jpeg = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
+    if (jpeg && jpeg.size <= MAX_BYTES) return jpeg;
+  }
+  throw new Error("the pasted image is too large even after compressing");
+}
+
+/** Pasted images become Attachments; any text in the clipboard still pastes as usual. */
+async function pasteImages(e: ClipboardEvent) {
+  const images = [...(e.clipboardData?.items ?? [])]
+    .filter((i) => i.kind === "file" && i.type.startsWith("image/"))
+    .map((i) => i.getAsFile())
+    .filter((f): f is File => f !== null);
+  if (!images.length || !runs) return;
+  for (const image of images) {
+    try {
+      const fitted = await fitImage(image);
+      const ext = fitted.type === "image/jpeg" ? "jpg" : fitted.type.split("/")[1];
+      pending.push({ name: `Pasted image ${++pasted}.${ext}`, data_url: await dataUrl(fitted) });
+    } catch (err) {
+      ui!.composerError.textContent = `Not attached: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+  renderPending();
 }
 
 function updateComposer() {
@@ -423,11 +496,11 @@ function scrollToEnd() {
   ui!.turns.scrollTop = ui!.turns.scrollHeight;
 }
 
-function addTurn(text: string, files: string[]): Turn {
+function addTurn(text: string, files: Attachment[]): Turn {
   ui!.turns.querySelector(".empty")?.remove();
   const user = h("div", { className: "user" });
   renderText(user, text);
-  if (files.length) user.append(h("div", { className: "files" }, ...files.map((f) => h("span", { className: "chip", textContent: `📎 ${basename(f)}` }))));
+  if (files.length) user.append(h("div", { className: "files" }, ...files.map((f) => chip(f))));
   const turn: Turn = {
     text,
     files,
@@ -484,6 +557,7 @@ async function send() {
   if (!text && !pending.length) return;
   const turn = addTurn(text, pending);
   pending = [];
+  ui!.composerError.textContent = "";
   renderPending();
   ui!.input.value = "";
   await beginRun(turn);
