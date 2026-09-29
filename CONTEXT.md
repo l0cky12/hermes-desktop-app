@@ -67,5 +67,41 @@ Closing a Turn's event stream at once and asking the API server to stop its Run.
 _Avoid_: cancel, abort
 
 **Approval request**:
-A Run pausing until a human allows or denies a risky command; this client shows it but cannot answer it.
+A Run pausing until a human allows or denies a risky command; this client can answer it only over SSH.
 _Avoid_: permission prompt, confirmation
+
+### Work
+
+**Profile**:
+A named Hermes agent identity on the host, with its own Skills and settings; the active Profile is the one the client works with.
+_Avoid_: agent, user, account
+
+**Board**:
+The Hermes Kanban board of Tasks; the client works with the default Board only.
+_Avoid_: project, kanban (as a noun)
+
+**Task**:
+A unit of work on the Board with a title, body, status, priority, and optional Assignee; unrelated to a Run or a Turn.
+_Avoid_: ticket, card, job
+
+**Assignee**:
+The Profile a Task is assigned to.
+_Avoid_: owner, worker
+
+**Comment**:
+A note appended to a Task's discussion.
+_Avoid_: message, reply
+
+**Dispatch**:
+One pass of the Hermes dispatcher that hands ready Tasks to their Assignees; a Dispatch preview shows what a pass would do without doing it.
+_Avoid_: run (reserved for Run), nudge
+
+**Skill**:
+An instruction file (SKILL.md) installed for a Profile, grouped by category, which can be enabled or disabled for that Profile.
+_Avoid_: plugin, tool, prompt
+
+### Diagnostics
+
+**Client log**:
+This client's own record of what it did while talking to Hermes (requests with method, path, and status; connection events; warnings). Never contains message content or secrets. Distinct from Hermes's server logs.
+_Avoid_: logs (unqualified), server log

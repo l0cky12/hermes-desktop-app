@@ -76,6 +76,7 @@ async function connect() {
   app.replaceChildren(h("p", { className: "loading", textContent: "Connecting to the gateway…" }));
   try {
     const status = await invoke<Status>("status");
+    signInRequired = status.auth_required;
     if (status.auth_required) {
       try {
         await invoke("check_sign_in");
@@ -316,6 +317,7 @@ function reauth(kind: "sign-in" | "key", reason: string): Promise<boolean | unde
 // ---- Chat ----
 
 let runs = false; // the API server accepts Runs and streams their events
+let signInRequired = true; // the Dashboard asks for Sign-in; without it, a 401 can't be fixed by signing in
 let overSsh = false; // Hermes over SSH (hermes acp): Approvals can be answered, Sessions can't be deleted
 let sessionId: string | null = null;
 let active: Turn | null = null;
@@ -351,7 +353,7 @@ function showChat(supported: boolean, ssh = false) {
     }
   };
   button.onclick = () => (active ? stop() : send());
-  app.replaceChildren(
+  mountShell(
     h(
       "div",
       { className: "chat" },
@@ -686,6 +688,491 @@ async function refreshSessions() {
     }),
   );
   markCurrent();
+}
+
+// ---- Shell: icon rail and views ----
+
+type View = { el: HTMLElement; show?: () => void; hide?: () => void };
+type ViewName = "chat" | "kanban" | "skills" | "logs";
+
+const SVG = "http://www.w3.org/2000/svg";
+const ICONS: Record<ViewName, string> = {
+  chat: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z",
+  kanban: "M3 3h18v18H3z M9 3v18 M15 3v18",
+  skills: "M12 2 2 7l10 5 10-5-10-5z M2 17l10 5 10-5 M2 12l10 5 10-5",
+  logs: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6 M16 13H8 M16 17H8 M10 9H8",
+};
+const LABELS: Record<ViewName, string> = { chat: "Chat", kanban: "Kanban", skills: "Skills", logs: "Logs" };
+
+function icon(d: string): SVGSVGElement {
+  const svg = document.createElementNS(SVG, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(SVG, "path");
+  path.setAttribute("d", d);
+  svg.append(path);
+  return svg;
+}
+
+let current: View | null = null;
+
+// Escape closes the Task drawer unless a dialog is open (dialogs handle their own Escape).
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || document.querySelector("dialog[open]")) return;
+  for (const drawer of document.querySelectorAll<HTMLElement>(".drawer")) drawer.hidden = true;
+});
+
+/** Replaces the app with the rail and its four views; Chat is shown first. */
+function mountShell(chat: HTMLElement) {
+  current?.hide?.();
+  const views: Record<ViewName, View> = { chat: { el: chat }, kanban: kanbanView(), skills: skillsView(), logs: logsView() };
+  const buttons = (Object.keys(views) as ViewName[]).map((name) => {
+    const button = h("button", { className: "rail-item", title: LABELS[name], onclick: () => select(name) });
+    button.setAttribute("aria-label", LABELS[name]);
+    button.dataset.view = name;
+    button.append(icon(ICONS[name]));
+    return button;
+  });
+  function select(name: ViewName) {
+    current?.hide?.();
+    for (const [n, v] of Object.entries(views)) v.el.hidden = n !== name;
+    for (const b of buttons) b.setAttribute("aria-current", String(b.dataset.view === name));
+    current = views[name];
+    current.show?.();
+  }
+  app.replaceChildren(h("div", { className: "shell" }, h("nav", { className: "rail" }, ...buttons), ...Object.values(views).map((v) => v.el)));
+  select("chat");
+}
+
+/** Runs a Board or Skills command; a rejected Sign-in cookie gets the usual Re-auth prompt, then one retry. */
+async function call<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
+  try {
+    return await invoke<T>(cmd, args);
+  } catch (e) {
+    if (asError(e).kind !== "unauthorized" || overSsh) throw e;
+    if (!signInRequired) throw { kind: "unauthorized", message: "Sign-in is required on the Dashboard for Kanban and Skills" };
+    await reauth("sign-in", "The dashboard rejected your sign-in.");
+    return await invoke<T>(cmd, args);
+  }
+}
+
+const when = (epochSeconds: number | null | undefined) =>
+  epochSeconds ? new Date(epochSeconds * 1000).toLocaleString() : "";
+
+function select(options: string[], all: string): HTMLSelectElement {
+  return h("select", {}, h("option", { value: "", textContent: all }), ...options.map((o) => h("option", { value: o, textContent: o })));
+}
+
+/** Keeps the chosen value when the options change. */
+function setOptions(el: HTMLSelectElement, options: string[], all: string) {
+  const value = el.value;
+  el.replaceChildren(h("option", { value: "", textContent: all }), ...options.map((o) => h("option", { value: o, textContent: o })));
+  el.value = options.includes(value) ? value : "";
+}
+
+// ---- Kanban ----
+
+type Task = { id: string; title: string; body: string | null; assignee: string | null; status: string; priority: number; tenant: string | null; created_at: number | null };
+type Comment = { author: string; body: string; created_at: number };
+type Detail = { task: Task; comments: Comment[] };
+
+const STATUSES = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"];
+const HIDDEN_WHEN_EMPTY = new Set(["scheduled", "review"]);
+const title = (status: string) => status[0].toUpperCase() + status.slice(1);
+
+function kanbanView(): View {
+  let tasks: Task[] = [];
+  let assignees: string[] = [];
+  let status = ""; // the status chip filter, "" for all
+  let timer: number | undefined;
+
+  const search = input({ type: "search", placeholder: "Search tasks", required: false });
+  const assignee = select([], "All assignees");
+  const tenant = select([], "All tenants");
+  const archived = h("input", { type: "checkbox" });
+  const chips = h("div", { className: "chips" });
+  const visible = h("p", { className: "muted" });
+  const error = h("p", { className: "error" });
+  const newTitle = input({ placeholder: "New task", required: false });
+  const columns = h("div", { className: "columns" });
+  const drawer = h("aside", { className: "drawer", hidden: true });
+  for (const el of [search, assignee, tenant, archived]) el.addEventListener("input", render);
+
+  newTitle.onkeydown = (e) => {
+    if (e.key !== "Enter" || !newTitle.value.trim()) return;
+    e.preventDefault();
+    create({ title: newTitle.value.trim() }, error).then((ok) => ok && (newTitle.value = ""));
+  };
+
+  async function create(task: Record<string, unknown>, errorEl: HTMLElement): Promise<boolean> {
+    errorEl.textContent = "";
+    try {
+      await call("kanban_create", { task });
+    } catch (e) {
+      errorEl.textContent = `Couldn't create the task: ${asError(e).message}`;
+      return false;
+    }
+    await load();
+    return true;
+  }
+
+  function moreForm() {
+    const dialog = h("dialog", { className: "form" });
+    const name = input({ value: newTitle.value });
+    const body = h("textarea", { rows: 6 });
+    const who = select(assignees, "Unassigned");
+    const priority = input({ type: "number", value: "0", required: false });
+    const tenantIn = input({ required: false });
+    const formError = h("p", { className: "error" });
+    const form = h("form", {}, h("h2", { textContent: "New task" }), field("Title", name), field("Body", body), field("Assignee", who),
+      h("div", { className: "row" }, field("Priority", priority), field("Tenant", tenantIn)), formError,
+      h("div", { className: "row" }, h("button", { textContent: "Create" }),
+        h("button", { type: "button", className: "secondary", textContent: "Cancel", onclick: () => dialog.close() })));
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const task = { title: name.value.trim(), body: body.value || null, assignee: who.value || null,
+        priority: priority.value === "" ? null : Number(priority.value), tenant: tenantIn.value.trim() || null };
+      if (await create(task, formError)) {
+        newTitle.value = "";
+        dialog.close();
+      }
+    };
+    dialog.onclose = () => dialog.remove();
+    dialog.append(form);
+    document.body.append(dialog);
+    dialog.showModal();
+  }
+
+  /** The non-empty parts of a Dispatch result, one line each. */
+  function summarize(result: Record<string, unknown>): string {
+    const lines = Object.entries(result).flatMap(([key, value]) => {
+      const label = key.replaceAll("_", " ");
+      if (typeof value === "number" && value > 0) return [`${label}: ${value}`];
+      if (Array.isArray(value) && value.length) return [`${label}: ${value.map((v) => (Array.isArray(v) ? v.slice(0, 2).join(" → ") : String(v))).join(", ")}`];
+      if (value === true) return [label];
+      return [];
+    });
+    return lines.join("\n") || "Nothing to do.";
+  }
+
+  async function dispatch(dryRun: boolean, errorEl: HTMLElement): Promise<string | null> {
+    errorEl.textContent = "";
+    try {
+      const result = summarize(await call("kanban_dispatch", { dryRun }));
+      if (!dryRun) await load();
+      return result;
+    } catch (e) {
+      errorEl.textContent = `Dispatch failed: ${asError(e).message}`;
+      return null;
+    }
+  }
+
+  async function preview() {
+    const summary = await dispatch(true, error);
+    if (summary === null) return;
+    const dialog = h("dialog", { className: "form" });
+    const text = h("pre", { className: "plain", textContent: summary });
+    const dialogError = h("p", { className: "error" });
+    const now = h("button", { textContent: "Dispatch now" });
+    now.onclick = async () => {
+      now.disabled = true;
+      const done = await dispatch(false, dialogError);
+      now.disabled = false;
+      if (done !== null) {
+        text.textContent = done;
+        now.hidden = true;
+      }
+    };
+    dialog.append(h("h2", { textContent: "Dispatch preview" }), text, dialogError,
+      h("div", { className: "row" }, now, h("button", { className: "secondary", textContent: "Close", onclick: () => dialog.close() })));
+    dialog.onclose = () => dialog.remove();
+    document.body.append(dialog);
+    dialog.showModal();
+  }
+
+  const lastDispatch = h("pre", { className: "plain muted" });
+  const run = h("button", { className: "secondary", textContent: "Run dispatcher" });
+  run.onclick = async () => {
+    run.disabled = true;
+    const done = await dispatch(false, error);
+    run.disabled = false;
+    if (done !== null) lastDispatch.textContent = done;
+  };
+
+  async function load() {
+    try {
+      // Profiles rarely change: fetched once, not on every 30 s refresh.
+      if (!assignees.length) assignees = await call<string[]>("kanban_assignees").catch(() => []);
+      tasks = await call<Task[]>("kanban_board");
+      error.textContent = "";
+    } catch (e) {
+      error.textContent = `Couldn't load the board: ${asError(e).message}`;
+    }
+    render();
+  }
+
+  function render() {
+    const names = (pick: (t: Task) => string | null) => [...new Set(tasks.map(pick).filter((v): v is string => !!v))].sort();
+    setOptions(assignee, [...new Set([...assignees, ...names((t) => t.assignee)])].sort(), "All assignees");
+    setOptions(tenant, names((t) => t.tenant), "All tenants");
+    const needle = search.value.trim().toLowerCase();
+    const shown = tasks.filter((t) =>
+      (archived.checked || t.status !== "archived") &&
+      (!assignee.value || t.assignee === assignee.value) &&
+      (!tenant.value || t.tenant === tenant.value) &&
+      (!needle || `${t.title}\n${t.body ?? ""}`.toLowerCase().includes(needle)));
+
+    const counts = new Map<string, number>();
+    for (const t of shown) counts.set(t.status, (counts.get(t.status) ?? 0) + 1);
+    const chip = (label: string, value: string) => {
+      const b = h("button", { className: "chip-button", textContent: label, onclick: () => ((status = status === value ? "" : value), render()) });
+      b.setAttribute("aria-pressed", String(status === value));
+      return b;
+    };
+    chips.replaceChildren(chip(`${shown.length} All`, ""),
+      ...[...STATUSES, "archived"].filter((s) => counts.get(s)).map((s) => chip(`${counts.get(s)} ${title(s)}`, s)));
+
+    const inView = shown.filter((t) => !status || t.status === status);
+    visible.textContent = `${inView.length} visible task${inView.length === 1 ? "" : "s"}`;
+    const lanes = [...STATUSES, ...(archived.checked ? ["archived"] : [])]
+      .filter((s) => !status || s === status)
+      .filter((s) => !HIDDEN_WHEN_EMPTY.has(s) || counts.get(s));
+    columns.replaceChildren(...lanes.map((lane) => {
+      const cards = inView.filter((t) => t.status === lane);
+      return h("section", { className: "column" },
+        h("header", {}, h("span", { textContent: title(lane) }), h("span", { className: "count", textContent: String(cards.length) })),
+        ...(cards.length ? cards.map(card) : [h("p", { className: "empty-lane", textContent: "Empty" })]));
+    }));
+  }
+
+  function card(t: Task): HTMLElement {
+    const body = (t.body ?? "").trim();
+    return h("article", { className: "card-task", tabIndex: 0, onclick: () => openDrawer(t.id), onkeydown: (e) => e.key === "Enter" && openDrawer(t.id) },
+      h("div", { className: "row" }, h("code", { textContent: t.id }), h("span", { className: "badge", textContent: `P${t.priority}` })),
+      h("h3", { textContent: t.title }),
+      ...(body ? [h("p", { className: "snippet", textContent: body.length > 140 ? `${body.slice(0, 140)}…` : body })] : []),
+      ...(t.assignee ? [h("p", { className: "assignee", textContent: `@${t.assignee}` })] : []));
+  }
+
+  async function openDrawer(id: string) {
+    drawer.hidden = false;
+    drawer.replaceChildren(h("p", { className: "loading", textContent: "Loading…" }));
+    let detail: Detail;
+    try {
+      detail = await call<Detail>("kanban_task", { id });
+    } catch (e) {
+      drawer.replaceChildren(closeButton(), h("p", { className: "error", textContent: `Couldn't load ${id}: ${asError(e).message}` }));
+      return;
+    }
+    const t = detail.task;
+    const text = h("textarea", { rows: 3, placeholder: "Add a comment" });
+    const commentError = h("p", { className: "error" });
+    const add = h("button", { textContent: "Add comment" });
+    add.onclick = async () => {
+      if (!text.value.trim()) return;
+      add.disabled = true;
+      try {
+        await call("kanban_comment", { id, text: text.value });
+        await openDrawer(id);
+      } catch (e) {
+        commentError.textContent = `Couldn't add the comment: ${asError(e).message}`;
+        add.disabled = false;
+      }
+    };
+    const meta = [t.id, title(t.status), t.assignee ? `@${t.assignee}` : "Unassigned", `P${t.priority}`, ...(t.tenant ? [t.tenant] : [])];
+    drawer.replaceChildren(
+      h("div", { className: "row" }, h("h2", { textContent: t.title }), closeButton()),
+      h("p", { className: "muted", textContent: meta.join(" · ") }),
+      h("div", { className: "task-body", textContent: t.body || "No description." }),
+      h("h2", { textContent: `Comments (${detail.comments.length})` }),
+      ...detail.comments.map((c) => h("div", { className: "comment" },
+        h("p", { className: "muted", textContent: `${c.author} · ${when(c.created_at)}` }), h("div", { className: "task-body", textContent: c.body }))),
+      text, commentError, add,
+    );
+  }
+
+  function closeButton() {
+    const b = h("button", { className: "link", textContent: "×", title: "Close", onclick: () => (drawer.hidden = true) });
+    b.setAttribute("aria-label", "Close");
+    return b;
+  }
+
+  const refresh = h("button", { className: "link", textContent: "↻", title: "Refresh", onclick: load });
+  refresh.setAttribute("aria-label", "Refresh");
+  const el = h("div", { className: "kanban", hidden: true },
+    h("aside", { className: "panel" },
+      h("div", { className: "row" }, h("h2", { textContent: "Kanban" }), refresh),
+      search, assignee, tenant, h("label", { className: "check" }, archived, " Include archived"), chips,
+      h("div", { className: "row" }, h("button", { className: "secondary", textContent: "Preview dispatcher", onclick: preview }), run),
+      lastDispatch,
+      h("div", { className: "row" }, newTitle, h("button", { className: "link", textContent: "More…", onclick: moreForm })),
+      visible, error),
+    h("main", {}, h("div", { className: "board-head" }, h("h1", { textContent: "Board" }), h("span", { className: "badge", textContent: "Default" })), columns),
+    drawer);
+  return {
+    el,
+    show() {
+      load();
+      timer = window.setInterval(load, 30_000);
+    },
+    hide() {
+      window.clearInterval(timer);
+    },
+  };
+}
+
+// ---- Skills ----
+
+type Skill = { name: string; description: string; category: string | null; enabled: boolean; essential: boolean };
+
+function skillsView(): View {
+  let skills: Skill[] = [];
+  let chosen: string | null = null;
+  const collapsed = new Set<string>();
+  const search = input({ type: "search", placeholder: "Search skills…", required: false });
+  const list = h("div", { className: "skill-list" });
+  const error = h("p", { className: "error" });
+  const detail = h("main", { className: "skill-detail" }, h("p", { className: "empty", textContent: "Pick a skill to read its SKILL.md." }));
+  search.oninput = render;
+
+  function toggle(skill: Skill, errorEl: HTMLElement): HTMLInputElement {
+    const box = h("input", { type: "checkbox", checked: skill.enabled, disabled: skill.essential, className: "switch" });
+    box.setAttribute("role", "switch");
+    box.setAttribute("aria-label", `${skill.enabled ? "Disable" : "Enable"} ${skill.name}`);
+    box.title = skill.essential ? "Essential: this skill can't be disabled" : skill.enabled ? "Enabled" : "Disabled";
+    box.onclick = (e) => e.stopPropagation();
+    box.onchange = async () => {
+      const enabled = box.checked;
+      box.disabled = true;
+      errorEl.textContent = "";
+      try {
+        await call("skill_toggle", { name: skill.name, enabled });
+        skill.enabled = enabled;
+      } catch (e) {
+        box.checked = !enabled;
+        errorEl.textContent = `Couldn't ${enabled ? "enable" : "disable"} ${skill.name}: ${asError(e).message}`;
+      }
+      render();
+      if (chosen === skill.name) renderHeader();
+    };
+    return box;
+  }
+
+  function render() {
+    const needle = search.value.trim().toLowerCase();
+    const shown = skills.filter((s) => !needle || `${s.name} ${s.description}`.toLowerCase().includes(needle));
+    const groups = new Map<string, Skill[]>();
+    for (const s of shown) groups.set(s.category ?? "general", [...(groups.get(s.category ?? "general") ?? []), s]);
+    const order = [...groups.keys()].sort((a, b) => (a === "general" ? -1 : b === "general" ? 1 : a.localeCompare(b)));
+    list.replaceChildren(...order.flatMap((group) => {
+      const members = groups.get(group)!.sort((a, b) => a.name.localeCompare(b.name));
+      const open = !collapsed.has(group) || !!needle;
+      const head = h("button", { className: "group", textContent: `${open ? "▾" : "▸"} ${group.toUpperCase()} (${members.length})`,
+        onclick: () => (collapsed.has(group) ? collapsed.delete(group) : collapsed.add(group), render()) });
+      head.setAttribute("aria-expanded", String(open));
+      return [head, ...(open ? members.map((s) => {
+        const row = h("div", { className: "skill-row", tabIndex: 0, onclick: () => choose(s.name), onkeydown: (e) => e.key === "Enter" && choose(s.name) },
+          toggle(s, error), h("span", { className: "name", textContent: s.name }), h("span", { className: "desc", textContent: s.description }));
+        row.classList.toggle("disabled", !s.enabled);
+        row.classList.toggle("current", s.name === chosen);
+        return row;
+      }) : [])];
+    }));
+  }
+
+  const header = h("div", { className: "row skill-head" });
+  const content = h("pre", { className: "plain skill-md" });
+  const detailError = h("p", { className: "error" });
+
+  function renderHeader() {
+    const skill = skills.find((s) => s.name === chosen);
+    if (!skill) return;
+    header.replaceChildren(toggle(skill, detailError), h("h2", { textContent: skill.name }),
+      h("span", { className: "muted", textContent: `${skill.category ?? "general"}${skill.essential ? " · essential" : ""}` }));
+  }
+
+  async function choose(name: string) {
+    chosen = name;
+    render();
+    renderHeader();
+    detailError.textContent = "";
+    content.textContent = "Loading…";
+    detail.replaceChildren(header, detailError, content);
+    try {
+      const text = await call<string>("skill_content", { name });
+      if (chosen === name) content.textContent = text;
+    } catch (e) {
+      if (chosen === name) content.textContent = "";
+      detailError.textContent = `Couldn't read ${name}: ${asError(e).message}`;
+    }
+  }
+
+  async function load() {
+    try {
+      skills = await call<Skill[]>("skills_list");
+      error.textContent = "";
+    } catch (e) {
+      error.textContent = `Couldn't load skills: ${asError(e).message}`;
+    }
+    render();
+  }
+
+  const el = h("div", { className: "skills", hidden: true }, h("aside", { className: "panel" }, search, error, list), detail);
+  return { el, show: load };
+}
+
+// ---- Logs (Client log) ----
+
+type LogLine = { time: number; source: string; text: string };
+const SOURCES = ["gateway", "ssh", "acp", "kanban", "keyring", "settings"];
+
+function logsView(): View {
+  let lines: LogLine[] = [];
+  const source = select(SOURCES, "All sources");
+  const search = input({ type: "search", placeholder: "Search the log", required: false });
+  const out = h("div", { className: "log" });
+  const format = (l: LogLine) => `${new Date(l.time).toLocaleTimeString([], { hour12: false })}.${String(l.time % 1000).padStart(3, "0")}  ${l.source.padEnd(8)}  ${l.text}`;
+  const matches = (l: LogLine) => (!source.value || l.source === source.value) && (!search.value || l.text.toLowerCase().includes(search.value.toLowerCase()));
+  const row = (l: LogLine) => h("div", { className: `log-line ${l.source}`, textContent: format(l) });
+  const atEnd = () => out.scrollHeight - out.scrollTop - out.clientHeight < 24;
+
+  function render() {
+    out.replaceChildren(...lines.filter(matches).map(row));
+    out.scrollTop = out.scrollHeight;
+  }
+  source.oninput = render;
+  search.oninput = render;
+
+  const channel = new Channel<LogLine>();
+  channel.onmessage = (line) => {
+    lines.push(line);
+    if (lines.length > 2000 && matches(lines.shift()!)) out.firstElementChild?.remove();
+    if (!matches(line)) return;
+    const follow = atEnd();
+    out.append(row(line));
+    if (follow) out.scrollTop = out.scrollHeight; // scrolled up to read? stay put
+  };
+  invoke<LogLine[]>("client_log", { onLine: channel }).then((held) => {
+    lines = [...held, ...lines];
+    render();
+  });
+
+  const copy = h("button", { className: "secondary", textContent: "Copy all" });
+  copy.onclick = async () => {
+    await navigator.clipboard.writeText(lines.map(format).join("\n"));
+    copy.textContent = "Copied";
+    setTimeout(() => (copy.textContent = "Copy all"), 1500);
+  };
+  const clear = h("button", { className: "secondary", textContent: "Clear", onclick: async () => {
+    await invoke("clear_client_log");
+    lines = [];
+    render();
+  } });
+  const el = h("div", { className: "logs", hidden: true },
+    h("div", { className: "row toolbar" }, h("h2", { textContent: "Client log" }), source, search, copy, clear),
+    h("p", { className: "muted", textContent: "What this app did while talking to Hermes: requests, commands, and connection events. Never message content or secrets." }),
+    out);
+  return { el, show: () => (out.scrollTop = out.scrollHeight) };
 }
 
 boot();

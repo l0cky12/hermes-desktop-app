@@ -96,6 +96,7 @@ pub async fn connect(host: &str) -> Result<Arc<Conn>, Error> {
     let client = json!({ "name": "hermes-desktop", "version": env!("CARGO_PKG_VERSION") });
     let init = json!({ "protocolVersion": 1, "clientCapabilities": {}, "clientInfo": client });
     conn.request("initialize", init).await?;
+    crate::log::write("acp", format!("connected to {host}"));
     Ok(conn)
 }
 
@@ -125,7 +126,8 @@ async fn read(conn: Arc<Conn>, mut lines: Lines<BufReader<ChildStdout>>, stderr:
         }
     }
     let why = exited(stderr.await.unwrap_or_default());
-    eprintln!("[acp] connection closed");
+    // Only the fact: the stderr tail in `why` could echo anything Hermes printed.
+    crate::log::write("acp", "connection closed");
     *conn.closed.lock().unwrap() = why.clone();
     conn.alive.store(false, Ordering::SeqCst);
     for (_, tx) in conn.pending.lock().unwrap().drain() {
@@ -191,6 +193,7 @@ impl Conn {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, Error> {
+        crate::log::write("acp", method.to_owned());
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
