@@ -2,7 +2,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 type GatewayError = { kind: "unreachable" | "unauthorized" | "not_found" | "http" | "invalid"; message: string };
-type Init = { dashboard_url: string | null; api_url: string | null; keyring: boolean };
+type Init = { dashboard_url: string | null; api_url: string | null; ssh_host: string | null; keyring: boolean };
 type Status = { auth_required: boolean; auth_providers: string[] };
 type RunStarted = { run_id: string; session_id: string };
 type RunEvent = { event: string; seq?: number; [field: string]: unknown };
@@ -67,7 +67,8 @@ async function boot() {
   app.replaceChildren(h("p", { className: "loading", textContent: "Opening the OS keyring… (unlock it if your system asks)" }));
   const init = await invoke<Init>("init");
   noteSaved(init.keyring);
-  if (init.dashboard_url && init.api_url) await connect();
+  if (init.ssh_host) await connectSsh();
+  else if (init.dashboard_url && init.api_url) await connect();
   else showPairing();
 }
 
@@ -96,14 +97,24 @@ async function connect() {
   }
 }
 
-function showConnect(error: GatewayError) {
+async function connectSsh() {
+  app.replaceChildren(h("p", { className: "loading", textContent: "Starting Hermes over SSH…" }));
+  try {
+    await invoke("connect_ssh");
+    showChat(true, true);
+  } catch (e) {
+    showConnect(asError(e), connectSsh);
+  }
+}
+
+function showConnect(error: GatewayError, retry = connect) {
   app.replaceChildren(
     h(
       "section",
       { className: "card" },
-      h("h1", { textContent: "Can't reach the gateway" }),
+      h("h1", { textContent: "Can't reach Hermes" }),
       h("p", { className: "error", textContent: error.message }),
-      h("div", { className: "row" }, h("button", { textContent: "Retry", onclick: connect }),
+      h("div", { className: "row" }, h("button", { textContent: "Retry", onclick: retry }),
         h("button", { className: "secondary", textContent: "Change gateway", onclick: () => showPairing() })),
     ),
   );
@@ -203,6 +214,34 @@ function showPairing() {
     step2.hidden = false;
   }
 
+  const sshHost = input({ placeholder: "liam@hermes.lan" });
+  const sshResult = h("p");
+  const sshConnect = h("button", { textContent: "Connect over SSH" });
+  const sshForm = h(
+    "form",
+    {},
+    h("h2", { textContent: "Or run Hermes over SSH" }),
+    h("p", { textContent: "Runs hermes acp on that host. Uses your SSH keys or ssh-agent; password prompts aren't supported. Set ports and usernames in ~/.ssh/config if you need to." }),
+    field("SSH host", sshHost),
+    sshConnect,
+    sshResult,
+  );
+  sshForm.onsubmit = async (e) => {
+    e.preventDefault();
+    sshConnect.disabled = true;
+    sshResult.className = "";
+    sshResult.textContent = "Connecting…";
+    try {
+      await invoke("configure_ssh", { host: sshHost.value });
+      showChat(true, true);
+    } catch (e) {
+      sshResult.className = "error";
+      sshResult.textContent = asError(e).message;
+    } finally {
+      sshConnect.disabled = false;
+    }
+  };
+
   app.replaceChildren(
     h(
       "section",
@@ -213,6 +252,7 @@ function showPairing() {
       check,
       probeResult,
       step2,
+      sshForm,
     ),
   );
 }
@@ -276,6 +316,7 @@ function reauth(kind: "sign-in" | "key", reason: string): Promise<boolean | unde
 // ---- Chat ----
 
 let runs = false; // the API server accepts Runs and streams their events
+let overSsh = false; // Hermes over SSH (hermes acp): Approvals can be answered, Sessions can't be deleted
 let sessionId: string | null = null;
 let active: Turn | null = null;
 let pending: string[] = [];
@@ -289,8 +330,9 @@ let ui: {
   drop: HTMLElement;
 } | null = null;
 
-function showChat(supported: boolean) {
+function showChat(supported: boolean, ssh = false) {
   runs = supported;
+  overSsh = ssh;
   const unavailable = "Chat unavailable: this API server does not advertise run submission with event streaming.";
   ui = {
     sessions: h("ul", { className: "sessions" }),
@@ -524,6 +566,18 @@ function onStream(turn: Turn, msg: StreamMsg) {
     case "tool.completed":
       return finishTool(turn, String(ev.tool), ev.duration, ev.error === true);
     case "approval.request":
+      if (Array.isArray(ev.options)) {
+        const options = ev.options as { id: string; name: string }[];
+        const answer = (optionId: string) => {
+          turn.notice.replaceChildren();
+          invoke("answer_permission", { runId: turn.runId, requestId: ev.request_id, optionId });
+        };
+        turn.notice.replaceChildren(
+          h("span", { textContent: `Approval needed: ${String(ev.description)} ` }),
+          ...options.map((o) => h("button", { className: "secondary", textContent: o.name, onclick: () => answer(o.id) })),
+        );
+        return;
+      }
       turn.notice.textContent = `Waiting for approval: ${String(ev.description ?? ev.command ?? "a command")}. This client can't answer approvals. Stop, or answer from another Hermes client; it is denied automatically when the approval times out.`;
       return;
     case "approval.responded":
@@ -626,7 +680,7 @@ async function refreshSessions() {
           del.textContent = "Delete";
         }, 3000);
       };
-      const li = h("li", { onclick: () => openSession(s.id) }, h("span", { textContent: s.title || s.preview || s.id }), del);
+      const li = h("li", { onclick: () => openSession(s.id) }, h("span", { textContent: s.title || s.preview || s.id }), ...(overSsh ? [] : [del]));
       li.dataset.id = s.id;
       return li;
     }),

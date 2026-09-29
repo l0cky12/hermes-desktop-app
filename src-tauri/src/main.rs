@@ -1,3 +1,4 @@
+mod acp;
 mod attach;
 mod gateway;
 mod sse;
@@ -8,17 +9,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tauri::{async_runtime, ipc::Channel, DragDropEvent, Manager, State, WindowEvent};
 
 const KEYRING_SERVICE: &str = "local.hermes-desktop";
 
-/// The only thing written to disk: where the gateway is. Never secrets.
-#[derive(Serialize, Deserialize)]
+/// The only thing written to disk: where the gateway is, or the SSH host running Hermes. Never secrets.
+#[derive(Serialize, Deserialize, Default)]
 struct Settings {
+    #[serde(default)]
     dashboard_url: String,
+    #[serde(default)]
     api_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_host: Option<String>,
 }
 
 /// Lives only in the OS keyring (or memory). Bound to the origins it was issued for, so an
@@ -40,6 +45,8 @@ struct Gateway {
 #[derive(Default)]
 struct Inner {
     gateway: Option<Gateway>,
+    /// Set instead of `gateway` when Hermes is reached with `ssh host hermes acp`.
+    ssh_host: Option<String>,
     creds: Creds,
     keyring: bool,
     run_stop: bool,
@@ -52,6 +59,14 @@ struct AppState {
     streams: Mutex<HashMap<String, async_runtime::JoinHandle<()>>>,
     /// Paths the user actually dropped on the window; the only files a Run may read.
     dropped: Mutex<HashSet<PathBuf>>,
+    hermes: tokio::sync::Mutex<Option<Arc<acp::Conn>>>,
+    /// SSH-mode Runs by run id: their Session, and the prompt until `stream_run` sends it.
+    acp_runs: Mutex<HashMap<String, AcpRun>>,
+}
+
+struct AcpRun {
+    session: String,
+    prompt: Option<Vec<Value>>,
 }
 
 impl AppState {
@@ -96,6 +111,30 @@ impl AppState {
             self.lock().keyring = false;
         }
         saved
+    }
+
+    fn ssh(&self) -> bool {
+        self.lock().ssh_host.is_some()
+    }
+
+    /// The SSH connection to Hermes, (re)started on demand.
+    async fn hermes(&self) -> Result<Arc<acp::Conn>, Error> {
+        let mut slot = self.hermes.lock().await;
+        if let Some(conn) = slot.as_ref().filter(|c| c.alive()) {
+            return Ok(conn.clone());
+        }
+        let host = self.lock().ssh_host.clone().ok_or_else(not_configured)?;
+        let conn = acp::connect(&host).await?;
+        *slot = Some(conn.clone());
+        Ok(conn)
+    }
+
+    fn write_settings(&self, settings: &Settings) -> Result<(), Error> {
+        let write = || -> std::io::Result<()> {
+            std::fs::create_dir_all(self.settings_path.parent().expect("settings file has a parent"))?;
+            std::fs::write(&self.settings_path, serde_json::to_vec_pretty(settings).expect("serializable"))
+        };
+        write().map_err(|e| Error::Invalid(format!("Could not save settings: {e}")))
     }
 
     async fn absorb(&self, response: &Response) {
@@ -158,10 +197,19 @@ fn save_creds(creds: Creds) -> bool {
     result.is_ok()
 }
 
-fn load_gateway(path: &Path) -> Option<Gateway> {
-    let settings: Settings = serde_json::from_slice(&std::fs::read(path).ok()?)
+fn load_settings(path: &Path) -> Option<Settings> {
+    serde_json::from_slice(&std::fs::read(path).ok()?)
         .inspect_err(|e| eprintln!("[settings] ignoring unreadable {}: {e}", path.display()))
-        .ok()?;
+        .ok()
+}
+
+fn load_ssh_host(settings: &Settings, path: &Path) -> Option<String> {
+    let host = acp::valid_host(settings.ssh_host.as_deref()?)
+        .inspect_err(|_| eprintln!("[settings] ignoring invalid SSH host in {}", path.display()));
+    host.ok()
+}
+
+fn load_gateway(settings: &Settings, path: &Path) -> Option<Gateway> {
     match (parse_origin(&settings.dashboard_url), parse_origin(&settings.api_url)) {
         (Ok(dashboard), Ok(api)) => Some(Gateway { dashboard, api }),
         _ => {
@@ -175,6 +223,7 @@ fn load_gateway(path: &Path) -> Option<Gateway> {
 struct Init {
     dashboard_url: Option<String>,
     api_url: Option<String>,
+    ssh_host: Option<String>,
     keyring: bool,
 }
 
@@ -195,6 +244,7 @@ async fn init(state: State<'_, AppState>) -> Result<Init, Error> {
     Ok(Init {
         dashboard_url: inner.gateway.as_ref().map(|g| g.dashboard.to_string()),
         api_url: inner.gateway.as_ref().map(|g| g.api.to_string()),
+        ssh_host: inner.ssh_host.clone(),
         keyring,
     })
 }
@@ -206,6 +256,7 @@ async fn configure(state: State<'_, AppState>, dashboard_url: String, api_url: S
     let changed = {
         let mut inner = state.lock();
         let changed = inner.gateway.as_ref() != Some(&gateway);
+        inner.ssh_host = None;
         if changed {
             inner.creds = Creds {
                 dashboard_url: gateway.dashboard.to_string(),
@@ -302,17 +353,67 @@ fn finish_pairing(state: State<'_, AppState>) -> Result<(), Error> {
     let settings = {
         let inner = state.lock();
         let gateway = inner.gateway.as_ref().ok_or_else(not_configured)?;
-        Settings { dashboard_url: gateway.dashboard.to_string(), api_url: gateway.api.to_string() }
+        Settings { dashboard_url: gateway.dashboard.to_string(), api_url: gateway.api.to_string(), ssh_host: None }
     };
-    let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(state.settings_path.parent().expect("settings file has a parent"))?;
-        std::fs::write(&state.settings_path, serde_json::to_vec_pretty(&settings).expect("serializable"))
-    };
-    write().map_err(|e| Error::Invalid(format!("Could not save settings: {e}")))
+    state.write_settings(&settings)
+}
+
+/// Switches to Hermes over SSH, saving the host once `hermes acp` answers. Drops every gateway
+/// credential: SSH keys do the authentication.
+#[tauri::command]
+async fn configure_ssh(state: State<'_, AppState>, host: String) -> Result<(), Error> {
+    let host = acp::valid_host(&host)?;
+    {
+        let mut inner = state.lock();
+        inner.gateway = None;
+        inner.creds = Creds::default();
+        inner.ssh_host = Some(host.clone());
+    }
+    state.hermes.lock().await.take();
+    state.persist().await;
+    state.hermes().await?;
+    state.write_settings(&Settings { ssh_host: Some(host), ..Settings::default() })
+}
+
+#[tauri::command]
+async fn connect_ssh(state: State<'_, AppState>) -> Result<(), Error> {
+    state.hermes().await.map(drop)
+}
+
+/// Answers an Approval request from Hermes over SSH; `None` denies by cancelling.
+#[tauri::command]
+async fn answer_permission(
+    state: State<'_, AppState>,
+    run_id: String,
+    request_id: Value,
+    option_id: Option<String>,
+) -> Result<(), Error> {
+    let session = state.acp_runs.lock().unwrap().get(&run_id).map(|r| r.session.clone());
+    if let Some(session) = session {
+        state.hermes().await?.answer(&session, request_id, option_id).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 async fn list_sessions(state: State<'_, AppState>) -> Result<Value, Error> {
+    if state.ssh() {
+        let hermes = state.hermes().await?;
+        // ponytail: first page only, like the API server's newest 100; follow nextCursor when it matters.
+        let mut page = hermes.request("session/list", json!({})).await?;
+        let mut cwds = hermes.cwds.lock().unwrap();
+        let sessions = page["sessions"].as_array_mut().map(std::mem::take).unwrap_or_default();
+        return Ok(sessions
+            .into_iter()
+            .map(|s| {
+                let id = s["sessionId"].as_str().unwrap_or_default().to_owned();
+                if let Some(cwd) = s["cwd"].as_str() {
+                    cwds.insert(id.clone(), cwd.to_owned());
+                }
+                json!({ "id": id, "title": s["title"] })
+            })
+            .collect());
+    }
     // ponytail: newest 100 only, no paging; add offset paging when 100 stops being enough.
     let request = state.api(Method::GET, &["api", "sessions"], &[("limit", "100")])?;
     Ok(json_body(send(&state.client, request).await?).await?["data"].take())
@@ -320,12 +421,25 @@ async fn list_sessions(state: State<'_, AppState>) -> Result<Value, Error> {
 
 #[tauri::command]
 async fn session_messages(state: State<'_, AppState>, id: String) -> Result<Value, Error> {
+    if state.ssh() {
+        let hermes = state.hermes().await?;
+        let cwd = hermes.cwds.lock().unwrap().get(&id).cloned().unwrap_or_else(|| hermes.home.clone());
+        let params = json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] });
+        let (loaded, replay) = hermes.collect(&id, "session/load", params).await?;
+        if loaded.is_null() {
+            return Err(Error::NotFound("Hermes has no such session".into()));
+        }
+        return Ok(json!(acp::history(&replay)));
+    }
     let request = state.api(Method::GET, &["api", "sessions", &id, "messages"], &[])?;
     Ok(json_body(send(&state.client, request).await?).await?["data"].take())
 }
 
 #[tauri::command]
 async fn delete_session(state: State<'_, AppState>, id: String) -> Result<(), Error> {
+    if state.ssh() {
+        return Err(Error::Invalid("Hermes over SSH can't delete sessions".into()));
+    }
     send(&state.client, state.api(Method::DELETE, &["api", "sessions", &id], &[])?).await?;
     Ok(())
 }
@@ -347,7 +461,23 @@ async fn start_run(
     if let Some(stray) = files.iter().find(|f| !state.dropped.lock().unwrap().contains(*f)) {
         return Err(Error::Invalid(format!("{} was not dropped into this window", stray.display())));
     }
-    let mut body = json!({ "input": attach::build_input(&text, &files).map_err(Error::Invalid)? });
+    let input = attach::build_input(&text, &files).map_err(Error::Invalid)?;
+    if state.ssh() {
+        let hermes = state.hermes().await?;
+        let session = match session_id {
+            Some(id) => id,
+            None => {
+                let created = hermes.request("session/new", json!({ "cwd": hermes.home, "mcpServers": [] })).await?;
+                created["sessionId"].as_str().ok_or_else(|| Error::Http("Session created without an id".into()))?.to_owned()
+            }
+        };
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let run_id = format!("acp-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let run = AcpRun { session: session.clone(), prompt: Some(acp::prompt_blocks(input)) };
+        state.acp_runs.lock().unwrap().insert(run_id.clone(), run);
+        return Ok(RunStarted { run_id, session_id: session });
+    }
+    let mut body = json!({ "input": input });
     if let Some(id) = &session_id {
         body["session_id"] = json!(id);
     }
@@ -376,6 +506,9 @@ async fn stream_run(
     last_seq: i64,
     on_event: Channel<StreamMsg>,
 ) -> Result<(), Error> {
+    if state.ssh() {
+        return stream_acp(app, state, run_id, on_event).await;
+    }
     let request = state
         .api(Method::GET, &["v1", "runs", &run_id, "events"], &[])?
         .header(header::ACCEPT, "text/event-stream")
@@ -422,11 +555,72 @@ async fn pump(mut response: Response, channel: &Channel<StreamMsg>) {
     let _ = channel.send(StreamMsg::Dropped { message });
 }
 
+/// Sends the Run's prompt and forwards its updates. There is no reattaching to an ACP prompt,
+/// so a second call is `NotFound` and Retry starts a new Run in the same Session.
+async fn stream_acp(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    run_id: String,
+    channel: Channel<StreamMsg>,
+) -> Result<(), Error> {
+    let gone = || Error::NotFound("This run can't be resumed over SSH".into());
+    let (session, prompt) = {
+        let mut runs = state.acp_runs.lock().unwrap();
+        let run = runs.get_mut(&run_id).ok_or_else(gone)?;
+        (run.session.clone(), run.prompt.take().ok_or_else(gone)?)
+    };
+    let hermes = state.hermes().await?;
+    let mut streams = state.streams.lock().unwrap();
+    let id = run_id.clone();
+    let task = async_runtime::spawn(async move {
+        let mut updates = hermes.subscribe(&session);
+        let request = hermes.request("session/prompt", json!({ "sessionId": session, "prompt": prompt }));
+        tokio::pin!(request);
+        let mut tools = HashMap::new();
+        let forward = |update: Value, tools: &mut HashMap<String, String>| {
+            acp::translate(&update, tools).into_iter().all(|data| channel.send(StreamMsg::Event { data }).is_ok())
+        };
+        let result = loop {
+            tokio::select! {
+                Some(update) = updates.recv() => if !forward(update, &mut tools) { break None },
+                result = &mut request => break Some(result),
+            }
+        };
+        if let Some(result) = result {
+            // Updates sent before the answer may still be queued behind it.
+            while let Ok(update) = updates.try_recv() {
+                forward(update, &mut tools);
+            }
+            let _ = match result {
+                Err(Error::Unreachable(message)) => channel.send(StreamMsg::Dropped { message }),
+                result => channel.send(StreamMsg::Event { data: acp::finished(result) }),
+            };
+        }
+        hermes.unsubscribe(&session);
+        let state = app.state::<AppState>();
+        state.streams.lock().unwrap().remove(&id);
+        state.acp_runs.lock().unwrap().remove(&id);
+    });
+    if let Some(old) = streams.insert(run_id, task) {
+        old.abort();
+    }
+    Ok(())
+}
+
 /// Stops the Turn at once by dropping its stream, then asks the server to stop the Run.
 #[tauri::command]
 async fn stop_run(state: State<'_, AppState>, run_id: String) -> Result<(), Error> {
     if let Some(task) = state.streams.lock().unwrap().remove(&run_id) {
         task.abort();
+    }
+    if state.ssh() {
+        let run = state.acp_runs.lock().unwrap().remove(&run_id);
+        if let Some(run) = run {
+            let hermes = state.hermes().await?;
+            hermes.unsubscribe(&run.session);
+            hermes.cancel(&run.session).await;
+        }
+        return Ok(());
     }
     if state.lock().run_stop {
         let request = state.api(Method::POST, &["v1", "runs", &run_id, "stop"], &[])?;
@@ -440,13 +634,17 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             let settings_path = app.path().app_config_dir()?.join("settings.json");
-            let gateway = load_gateway(&settings_path);
+            let settings = load_settings(&settings_path);
+            let ssh_host = settings.as_ref().and_then(|s| load_ssh_host(s, &settings_path));
+            let gateway = settings.as_ref().filter(|_| ssh_host.is_none()).and_then(|s| load_gateway(s, &settings_path));
             app.manage(AppState {
                 client: gateway::client(),
                 settings_path,
-                inner: Mutex::new(Inner { gateway, ..Inner::default() }),
+                inner: Mutex::new(Inner { gateway, ssh_host, ..Inner::default() }),
                 streams: Mutex::default(),
                 dropped: Mutex::default(),
+                hermes: tokio::sync::Mutex::default(),
+                acp_runs: Mutex::default(),
             });
             Ok(())
         })
@@ -464,6 +662,9 @@ fn main() {
             capabilities,
             set_api_key,
             finish_pairing,
+            configure_ssh,
+            connect_ssh,
+            answer_permission,
             list_sessions,
             session_messages,
             delete_session,

@@ -41,9 +41,15 @@ npm run tauri build -- --no-bundle   # release binary: src-tauri/target/release/
 
 On first launch, enter the Dashboard URL (usually `http://<host>:9119`) and the API server URL (usually `http://<host>:8642`). Then **Check gateway**, sign in if the gateway requires it, and enter the `API_SERVER_KEY`. URLs must be plain `http(s)://host[:port]`. HTTPS uses the system trust store; there is no custom certificate handling.
 
+### Over SSH instead
+
+Under **Or run Hermes over SSH**, enter a host (`host`, `user@host`, or an `~/.ssh/config` alias). The app runs `ssh <host> hermes acp` and speaks the Agent Client Protocol over that connection, so there's no Dashboard, sign-in, or API key; your SSH keys or ssh-agent do the authentication. SSH runs in batch mode, so password and host-key prompts can't be answered: connect once from a terminal first to accept the host key. `hermes` must be on the remote `PATH` (`~/.local/bin` is added automatically).
+
+Over SSH, the app can answer Approval requests. Sessions can't be deleted, and a dropped connection can't be reattached, so Retry starts a new Run in the same Session.
+
 ## Where things are stored
 
-- `~/.config/local.hermes-desktop/settings.json` holds the two gateway URLs. It never holds secrets.
+- `~/.config/local.hermes-desktop/settings.json` holds the two gateway URLs, or the SSH host. It never holds secrets.
 - The API key and sign-in cookie are stored as one entry in the OS keyring: Secret Service on Linux, Keychain on macOS, Credential Manager on Windows. That entry is bound to the gateway URLs it was issued for.
 - **Keyring fallback:** if the keyring is missing, locked, or doesn't answer within 10 s (headless machines, CI), the app says so in a banner. Credentials then stay in memory for that run only, and it asks for them again on the next launch. It never falls back to a plaintext file.
 - Logs go to stderr and contain request method, path, and status only.
@@ -83,3 +89,5 @@ src-tauri/target/release/hermes-desktop
 ```
 
 `python3 mock/drag.py FILE...` opens a GTK drag source. You can drag from it with xdotool (`mousedown 1`, a few `mousemove` steps into the app window, then `mouseup 1`).
+
+`mock/fake-ssh` stands in for `ssh` and runs the remote command locally, so SSH mode can be tried against a local `hermes`: start the app with `HERMES_DESKTOP_SSH=$PWD/mock/fake-ssh npm run tauri dev` and enter any host. `(cd src-tauri && HERMES_DESKTOP_SSH=$PWD/../mock/fake-ssh cargo test -- --ignored)` lists and loads real Sessions that way.

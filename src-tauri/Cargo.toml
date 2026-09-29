@@ -16,3 +16,5 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 keyring = "4"
 # Image attachments are sent as base64 data URLs.
 base64 = "0.22"
+# `ssh host hermes acp` child process and its JSON-RPC plumbing (acp.rs); same tokio Tauri runs on.
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt"] }

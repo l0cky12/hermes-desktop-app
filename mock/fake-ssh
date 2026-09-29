@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stands in for ssh in tests: ignores the options and host, runs the remote command locally.
+# HERMES_DESKTOP_SSH=$PWD/mock/fake-ssh npm run tauri dev
+for last; do :; done
+exec sh -c "$last"
