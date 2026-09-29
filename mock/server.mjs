@@ -154,18 +154,22 @@ const board = [
 ];
 const comments = { t_922275a1: [{ id: 1, task_id: "t_922275a1", author: "dashboard", body: "Waiting on the profile build.", created_at: Math.floor(now()) - 600 }] };
 const skills = [
-  { name: "unslop", description: "Cut AI tells from any writing.", category: null, enabled: true },
-  { name: "grill-me", description: "Interview before building medium/larger projects.", category: null, enabled: true },
-  { name: "codex", description: "Delegate coding to OpenAI Codex.", category: "autonomous-ai-agents", enabled: false },
-  { name: "hermes-agent", description: "Use, configure, and extend Hermes.", category: "autonomous-ai-agents", enabled: true },
-  { name: "ad-cs-certificate-request", description: "Request AD CS certificates.", category: "devops", enabled: true },
+  { name: "unslop", description: "Cut AI tells from any writing.", category: null },
+  { name: "grill-me", description: "Interview before building medium/larger projects.", category: null },
+  { name: "codex", description: "Delegate coding to OpenAI Codex.", category: "autonomous-ai-agents" },
+  { name: "hermes-agent", description: "Use, configure, and extend Hermes.", category: "autonomous-ai-agents" },
+  { name: "ad-cs-certificate-request", description: "Request AD CS certificates.", category: "devops" },
 ];
+// Each Profile's own skills.disabled; no `profile` is the Dashboard's own (default).
+const disabled = { default: new Set(["codex"]), orchestrator: new Set(["unslop", "ad-cs-certificate-request"]), coder: new Set() };
 
 async function work(req, res, url) {
   const path = url.pathname.replace("/api/plugins/kanban", "kanban");
   const route = `${req.method} ${path.replace(/t_[0-9a-z]+/, ":id")}`;
   const id = path.match(/t_[0-9a-z]+/)?.[0];
   if (path.startsWith("kanban") && env.MOCK_KANBAN === "off") return send(res, 404, { detail: "Not Found" });
+  const off = disabled[url.searchParams.get("profile") ?? "default"];
+  if (path.startsWith("/api/skills") && !off) return send(res, 404, { detail: "Profile does not exist." });
   switch (route) {
     case "GET kanban/board": {
       const archived = url.searchParams.get("include_archived") === "true";
@@ -197,7 +201,7 @@ async function work(req, res, url) {
       return send(res, 200, { reclaimed: 0, promoted: 0, spawned: ready.map((t) => [t.id, t.assignee, "/tmp/ws"]), skipped_unassigned: [], skipped_locked: false });
     }
     case "GET /api/skills":
-      return send(res, 200, skills);
+      return send(res, 200, skills.map((s) => ({ ...s, enabled: !off.has(s.name) })));
     case "GET /api/skills/content": {
       const found = skills.find((s) => s.name === url.searchParams.get("name"));
       return found ? send(res, 200, { name: found.name, content: `---\nname: ${found.name}\ndescription: ${found.description}\n---\n\n# ${found.name}\n\nMock SKILL.md.\n`, path: "/mock" })
@@ -207,8 +211,10 @@ async function work(req, res, url) {
       const body = await readJson(req);
       const found = skills.find((s) => s.name === body?.name);
       if (!found) return send(res, 404, { detail: "Skill not found." });
-      found.enabled = body.name === "hermes-agent" || !!body.enabled;
-      return send(res, 200, { ok: true, name: found.name, enabled: found.enabled });
+      const enabled = body.name === "hermes-agent" || !!body.enabled;
+      if (enabled) off.delete(found.name);
+      else off.add(found.name);
+      return send(res, 200, { ok: true, name: found.name, enabled });
     }
   }
   send(res, 404, { detail: "Not Found" });

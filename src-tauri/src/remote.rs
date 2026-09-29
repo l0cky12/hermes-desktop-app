@@ -91,12 +91,21 @@ pub fn quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
 }
 
-/// `hermes <words> <args>`, every arg quoted. User-supplied positionals go after `--`, and
-/// option values are joined as `--flag=value`, so nothing typed can be read as an option.
-fn hermes(summary: &'static str, args: &[String]) -> Cmd {
+/// `hermes`, or `hermes -p <profile>` to act on that Profile; `None` is the Gateway's default.
+fn bin(profile: Option<&str>) -> String {
+    profile.map_or("hermes".into(), |p| format!("hermes -p {}", quote(p)))
+}
+
+/// `hermes <words> <args>` for `profile`, every arg quoted. User-supplied positionals go after
+/// `--`, and option values are joined as `--flag=value`, so nothing typed can be read as an option.
+fn hermes_as(profile: Option<&str>, summary: &'static str, args: &[String]) -> Cmd {
     let words = summary.strip_prefix("hermes ").expect("summary names a hermes subcommand");
     let args: Vec<String> = args.iter().map(|a| quote(a)).collect();
-    Cmd { summary, script: format!("exec hermes {words} {}", args.join(" ")), stdin: None }
+    Cmd { summary, script: format!("exec {} {words} {}", bin(profile), args.join(" ")), stdin: None }
+}
+
+fn hermes(summary: &'static str, args: &[String]) -> Cmd {
+    hermes_as(None, summary, args)
 }
 
 pub fn kanban_list() -> Cmd {
@@ -140,19 +149,23 @@ pub fn kanban_dispatch(dry_run: bool) -> Cmd {
     hermes("hermes kanban dispatch", &args)
 }
 
-/// The active Profile's home: `hermes config path` names its config.yaml (last line, past any chatter).
-const PROFILE_HOME: &str = "home=$(hermes config path | tail -n 1) && home=${home%/*} || exit 1";
+/// The Profile's home: `hermes config path` names its config.yaml (last line, past any chatter).
+fn profile_home(profile: Option<&str>) -> String {
+    format!("home=$({} config path | tail -n 1) && home=${{home%/*}} || exit 1", bin(profile))
+}
 
 /// The disabled list, then every SKILL.md's frontmatter under the Profile's skills directory,
 /// skipping hidden directories as Hermes does (`.archive`, `.hub`, …). Parsed by
 /// `work::skills_from_ssh`.
 // ponytail: only the Profile's own skills dir; add `skills.external_dirs` when someone uses them.
-pub fn skills_list() -> Cmd {
+pub fn skills_list(profile: Option<&str>) -> Cmd {
     let script = format!(
-        "{PROFILE_HOME}; hermes config get skills.disabled --json 2>/dev/null; printf '\\n{}\\n'; \
+        "{}; {} config get skills.disabled --json 2>/dev/null; printf '\\n{}\\n'; \
          cd \"$home/skills\" 2>/dev/null || exit 0; \
          exec find -L . -name SKILL.md ! -path '*/.*/*' -exec awk \
          'FNR==1 {{ print \"{}\" FILENAME; if ($0 !~ /^---/) nextfile; next }} /^---/ {{ nextfile }} {{ print }}' {{}} +",
+        profile_home(profile),
+        bin(profile),
         crate::work::SKILLS_MARK,
         crate::work::FILE_MARK,
     );
@@ -160,17 +173,17 @@ pub fn skills_list() -> Cmd {
 }
 
 /// One SKILL.md, by the path `skills_list` reported for it.
-pub fn skill_content(path: &str) -> Cmd {
-    let script = format!("{PROFILE_HOME}; exec cat -- \"$home/skills/\"{}", quote(path));
+pub fn skill_content(profile: Option<&str>, path: &str) -> Cmd {
+    let script = format!("{}; exec cat -- \"$home/skills/\"{}", profile_home(profile), quote(path));
     Cmd { summary: "hermes skills (read)", script, stdin: None }
 }
 
-pub fn skills_disabled() -> Cmd {
-    hermes("hermes config get", &["skills.disabled".into(), "--json".into()])
+pub fn skills_disabled(profile: Option<&str>) -> Cmd {
+    hermes_as(profile, "hermes config get", &["skills.disabled".into(), "--json".into()])
 }
 
-pub fn skills_set_disabled(names: &[String]) -> Cmd {
-    hermes("hermes config set", &["skills.disabled".into(), serde_json::to_string(names).expect("serializable")])
+pub fn skills_set_disabled(profile: Option<&str>, names: &[String]) -> Cmd {
+    hermes_as(profile, "hermes config set", &["skills.disabled".into(), serde_json::to_string(names).expect("serializable")])
 }
 
 #[cfg(test)]
@@ -216,8 +229,16 @@ mod tests {
 
     #[test]
     fn disabling_skills_writes_them_as_one_json_list() {
-        let cmd = skills_set_disabled(&["a'b".to_owned(), "c d".to_owned()]);
+        let cmd = skills_set_disabled(None, &["a'b".to_owned(), "c d".to_owned()]);
         assert_eq!(argv_seen_by_hermes(&cmd), ["config", "set", "skills.disabled", r#"["a'b","c d"]"#]);
+    }
+
+    #[test]
+    fn skill_commands_run_as_the_chosen_profile() {
+        let cmd = skills_set_disabled(Some("coder"), &["a".to_owned()]);
+        assert_eq!(argv_seen_by_hermes(&cmd), ["-p", "coder", "config", "set", "skills.disabled", r#"["a"]"#]);
+        assert_eq!(argv_seen_by_hermes(&skills_disabled(Some("coder"))), ["-p", "coder", "config", "get", "skills.disabled", "--json"]);
+        assert_eq!(argv_seen_by_hermes(&kanban_assignees()), ["kanban", "assignees", "--json"]);
     }
 
     #[test]
@@ -236,12 +257,12 @@ mod tests {
         let bin = home.join(".local/bin");
         std::fs::create_dir_all(&bin).unwrap();
         let fake = format!(
-            "#!/bin/sh\ncase \"$*\" in\n  'config path') echo {}/config.yaml ;;\n  'config get skills.disabled --json') echo '[\"unslop\"]' ;;\nesac\n",
+            "#!/bin/sh\ncase \"$*\" in\n  '-p coder config path') echo {}/config.yaml ;;\n  '-p coder config get skills.disabled --json') echo '[\"unslop\"]' ;;\nesac\n",
             profile.display()
         );
         std::fs::write(bin.join("hermes"), fake).unwrap();
         std::process::Command::new("chmod").arg("+x").arg(bin.join("hermes")).status().unwrap();
-        let out = std::process::Command::new("sh").arg("-c").arg(skills_list().remote_line()).env("HOME", &home).output().unwrap();
+        let out = std::process::Command::new("sh").arg("-c").arg(skills_list(Some("coder")).remote_line()).env("HOME", &home).output().unwrap();
 
         let (skills, paths) = crate::work::skills_from_ssh(&String::from_utf8(out.stdout).unwrap());
         let mut names: Vec<_> = skills.iter().map(|s| (s.name.as_str(), s.enabled, s.description.as_str())).collect();
@@ -249,7 +270,7 @@ mod tests {
         assert_eq!(names, [("ad-cs", true, "Request certs"), ("no-frontmatter", true, ""), ("unslop", false, "Cut AI tells")]);
         assert_eq!(paths["ad-cs"], "devops/ad-cs/SKILL.md");
 
-        let out = std::process::Command::new("sh").arg("-c").arg(skill_content(&paths["unslop"]).remote_line()).env("HOME", &home).output().unwrap();
+        let out = std::process::Command::new("sh").arg("-c").arg(skill_content(Some("coder"), &paths["unslop"]).remote_line()).env("HOME", &home).output().unwrap();
         assert!(String::from_utf8(out.stdout).unwrap().ends_with("# Body\n---\n"));
     }
 
@@ -262,9 +283,9 @@ mod tests {
         let detail = crate::work::detail_from(json(&run("localhost", kanban_show(&first.id)).await.unwrap()).unwrap()).unwrap();
         assert_eq!(detail.task.id, first.id);
         assert!(!crate::work::assignee_names(json(&run("localhost", kanban_assignees()).await.unwrap()).unwrap()).is_empty());
-        let (skills, paths) = crate::work::skills_from_ssh(&run("localhost", skills_list()).await.unwrap());
+        let (skills, paths) = crate::work::skills_from_ssh(&run("localhost", skills_list(None)).await.unwrap());
         let skill = skills.iter().find(|s| !s.description.is_empty()).expect("a skill with a description");
-        assert!(run("localhost", skill_content(&paths[&skill.name])).await.unwrap().contains(&skill.name));
+        assert!(run("localhost", skill_content(None, &paths[&skill.name])).await.unwrap().contains(&skill.name));
     }
 
     #[test]
