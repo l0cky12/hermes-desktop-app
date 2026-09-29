@@ -779,13 +779,13 @@ function stop() {
   const turn = active;
   if (!turn?.runId) return;
   setStatus(turn, "stopped", "Stopped");
-  invoke("stop_run", { runId: turn.runId });
+  return invoke("stop_run", { runId: turn.runId });
 }
 
 /** Leaving a Session stops its streaming Turn so nothing keeps writing into a closed view. */
 function leave() {
-  if (active?.runId) stop();
-  else if (active) setStatus(active, "stopped", "Stopped");
+  if (active?.runId) return stop();
+  if (active) setStatus(active, "stopped", "Stopped");
 }
 
 function markCurrent() {
@@ -888,7 +888,7 @@ async function setupProfiles() {
 
 /** Switches the whole view to a Profile: its Sessions, its API key, and a new chat. */
 async function useProfile(name: string, previous: string | null) {
-  leave();
+  await leave()?.catch(() => {}); // the Stop must reach the old Profile before requests switch to the new one
   try {
     await invoke("set_profile", { name });
     if (!overSsh) {
