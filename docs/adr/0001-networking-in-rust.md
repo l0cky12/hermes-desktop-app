@@ -1,0 +1,3 @@
+# All gateway traffic goes through Rust, never webview fetch
+
+Every Dashboard and API server request, including the Run event stream, is made by reqwest in the Tauri shell; the webview only calls Tauri commands and receives stream events over a channel. Webview `fetch` would be cross-origin from `tauri://localhost`, and the API server answers any request carrying a non-allowlisted `Origin` with a bare 403 (its allowlist is empty by default, `gateway/platforms/api_server.py` CORS middleware), the webview won't persist a cross-site cookie over plain HTTP (`SameSite=None` requires `Secure`), and it would put the API key in JavaScript. Keeping it in Rust also puts credential host-pinning and the keyring in one place the webview can't reach.
