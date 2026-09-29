@@ -1,0 +1,476 @@
+mod attach;
+mod gateway;
+mod sse;
+
+use gateway::{absorb_cookies, cookie_header, describe, endpoint, parse_origin, send, Error};
+use reqwest::{header, Method, RequestBuilder, Response, Url};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+use tauri::{async_runtime, ipc::Channel, DragDropEvent, Manager, State, WindowEvent};
+
+const KEYRING_SERVICE: &str = "local.hermes-desktop";
+
+/// The only thing written to disk: where the gateway is. Never secrets.
+#[derive(Serialize, Deserialize)]
+struct Settings {
+    dashboard_url: String,
+    api_url: String,
+}
+
+/// Lives only in the OS keyring (or memory). Bound to the origins it was issued for, so an
+/// edited settings file can't redirect stored credentials to another host.
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Creds {
+    dashboard_url: String,
+    api_url: String,
+    api_key: Option<String>,
+    cookies: BTreeMap<String, String>,
+}
+
+#[derive(PartialEq)]
+struct Gateway {
+    dashboard: Url,
+    api: Url,
+}
+
+#[derive(Default)]
+struct Inner {
+    gateway: Option<Gateway>,
+    creds: Creds,
+    keyring: bool,
+    run_stop: bool,
+}
+
+struct AppState {
+    client: reqwest::Client,
+    settings_path: PathBuf,
+    inner: Mutex<Inner>,
+    streams: Mutex<HashMap<String, async_runtime::JoinHandle<()>>>,
+    /// Paths the user actually dropped on the window; the only files a Run may read.
+    dropped: Mutex<HashSet<PathBuf>>,
+}
+
+impl AppState {
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap()
+    }
+
+    /// Dashboard request; the sign-in cookie is only ever attached here.
+    fn dashboard(&self, method: Method, path: &[&str]) -> Result<RequestBuilder, Error> {
+        let inner = self.lock();
+        let gateway = inner.gateway.as_ref().ok_or_else(not_configured)?;
+        let request = self.client.request(method, endpoint(&gateway.dashboard, path));
+        Ok(match inner.creds.cookies.is_empty() {
+            true => request,
+            false => request.header(header::COOKIE, cookie_header(&inner.creds.cookies)),
+        })
+    }
+
+    /// API server request; the API key is only ever attached here.
+    fn api(&self, method: Method, path: &[&str], query: &[(&str, &str)]) -> Result<RequestBuilder, Error> {
+        let inner = self.lock();
+        let gateway = inner.gateway.as_ref().ok_or_else(not_configured)?;
+        let key = inner.creds.api_key.as_deref().ok_or_else(|| Error::Unauthorized("No API key saved".into()))?;
+        let mut url = endpoint(&gateway.api, path);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        Ok(self.client.request(method, url).bearer_auth(key))
+    }
+
+    /// Writes current credentials to the keyring. `false` means they are held in memory only.
+    async fn persist(&self) -> bool {
+        let (creds, keyring) = {
+            let inner = self.lock();
+            (inner.creds.clone(), inner.keyring)
+        };
+        if !keyring {
+            return false;
+        }
+        let saved = async_runtime::spawn_blocking(move || save_creds(creds)).await.unwrap_or(false);
+        if !saved {
+            self.lock().keyring = false;
+        }
+        saved
+    }
+
+    async fn absorb(&self, response: &Response) {
+        let changed = absorb_cookies(&mut self.lock().creds.cookies, response.headers());
+        if changed {
+            self.persist().await;
+        }
+    }
+}
+
+fn not_configured() -> Error {
+    Error::Invalid("No gateway configured".into())
+}
+
+async fn json_body(response: Response) -> Result<Value, Error> {
+    response.json().await.map_err(|e| Error::Http(format!("Unreadable response: {}", describe(&e))))
+}
+
+fn keyring_entry() -> keyring::Result<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, "credentials")
+}
+
+/// A Secret Service that is activatable but never answers, or an unlock prompt nobody sees,
+/// blocks keyring calls forever. Bound them; no answer counts as "keyring unavailable".
+// ponytail: fixed 10 s bound; a manual unlock slower than that runs memory-only until next launch.
+fn bounded<T: Send + 'static>(call: impl FnOnce() -> keyring::Result<T> + Send + 'static) -> keyring::Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(call()));
+    rx.recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|_| Err(keyring::Error::PlatformFailure("no answer from the OS keyring within 10 s".into())))
+}
+
+/// `(stored credentials, keyring usable)`. An unusable keyring is reported, never worked around.
+fn load_creds() -> (Option<Creds>, bool) {
+    match bounded(|| keyring_entry()?.get_password()) {
+        Ok(json) => (serde_json::from_str(&json).ok(), true),
+        Err(keyring::Error::NoEntry) => (None, true),
+        Err(e) => {
+            eprintln!("[keyring] unavailable, credentials will not be saved: {e}");
+            (None, false)
+        }
+    }
+}
+
+fn save_creds(creds: Creds) -> bool {
+    let result = bounded(move || {
+        let entry = keyring_entry()?;
+        if creds.api_key.is_none() && creds.cookies.is_empty() {
+            match entry.delete_credential() {
+                Err(keyring::Error::NoEntry) => Ok(()),
+                other => other,
+            }
+        } else {
+            entry.set_password(&serde_json::to_string(&creds).expect("serializable"))
+        }
+    });
+    if let Err(e) = &result {
+        eprintln!("[keyring] save failed, credentials kept in memory only: {e}");
+    }
+    result.is_ok()
+}
+
+fn load_gateway(path: &Path) -> Option<Gateway> {
+    let settings: Settings = serde_json::from_slice(&std::fs::read(path).ok()?)
+        .inspect_err(|e| eprintln!("[settings] ignoring unreadable {}: {e}", path.display()))
+        .ok()?;
+    match (parse_origin(&settings.dashboard_url), parse_origin(&settings.api_url)) {
+        (Ok(dashboard), Ok(api)) => Some(Gateway { dashboard, api }),
+        _ => {
+            eprintln!("[settings] ignoring invalid gateway URLs in {}", path.display());
+            None
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct Init {
+    dashboard_url: Option<String>,
+    api_url: Option<String>,
+    keyring: bool,
+}
+
+/// Loads stored credentials. Runs off the main thread so a slow keyring never blocks the window.
+#[tauri::command]
+async fn init(state: State<'_, AppState>) -> Result<Init, Error> {
+    let (stored, keyring) = async_runtime::spawn_blocking(load_creds).await.unwrap_or((None, false));
+    let mut inner = state.lock();
+    inner.keyring = keyring;
+    inner.creds = match (stored, &inner.gateway) {
+        (Some(c), Some(g)) if c.dashboard_url == g.dashboard.as_str() && c.api_url == g.api.as_str() => c,
+        (Some(_), _) => {
+            eprintln!("[keyring] stored credentials belong to a different gateway; ignoring them");
+            Creds::default()
+        }
+        (None, _) => Creds::default(),
+    };
+    Ok(Init {
+        dashboard_url: inner.gateway.as_ref().map(|g| g.dashboard.to_string()),
+        api_url: inner.gateway.as_ref().map(|g| g.api.to_string()),
+        keyring,
+    })
+}
+
+/// Points the client at a gateway. Changing gateways drops every credential for the old one.
+#[tauri::command]
+async fn configure(state: State<'_, AppState>, dashboard_url: String, api_url: String) -> Result<(), Error> {
+    let gateway = Gateway { dashboard: parse_origin(&dashboard_url)?, api: parse_origin(&api_url)? };
+    let changed = {
+        let mut inner = state.lock();
+        let changed = inner.gateway.as_ref() != Some(&gateway);
+        if changed {
+            inner.creds = Creds {
+                dashboard_url: gateway.dashboard.to_string(),
+                api_url: gateway.api.to_string(),
+                ..Creds::default()
+            };
+            inner.gateway = Some(gateway);
+        }
+        changed
+    };
+    if changed {
+        state.persist().await;
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct Status {
+    auth_required: bool,
+    auth_providers: Vec<String>,
+}
+
+#[tauri::command]
+async fn status(state: State<'_, AppState>) -> Result<Status, Error> {
+    let body = json_body(send(&state.client, state.dashboard(Method::GET, &["api", "status"])?).await?).await?;
+    let auth_required = body["auth_required"]
+        .as_bool()
+        .ok_or_else(|| Error::Invalid("Not a Hermes dashboard: /api/status has no auth_required".into()))?;
+    let auth_providers = body["auth_providers"]
+        .as_array()
+        .map(|list| list.iter().filter_map(|p| p.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    Ok(Status { auth_required, auth_providers })
+}
+
+/// Basic-provider sign-in. Returns whether the sign-in cookie was saved to the keyring.
+#[tauri::command]
+async fn sign_in(state: State<'_, AppState>, username: String, password: String) -> Result<bool, Error> {
+    let body = json!({ "provider": "basic", "username": username, "password": password });
+    let request = state.dashboard(Method::POST, &["auth", "password-login"])?.json(&body);
+    let response = send(&state.client, request).await?;
+    absorb_cookies(&mut state.lock().creds.cookies, response.headers());
+    Ok(state.persist().await)
+}
+
+/// Confirms the sign-in cookie via `/api/auth/me`, keeping any rotated cookies it hands back.
+#[tauri::command]
+async fn check_sign_in(state: State<'_, AppState>) -> Result<String, Error> {
+    match send(&state.client, state.dashboard(Method::GET, &["api", "auth", "me"])?).await {
+        Ok(response) => {
+            state.absorb(&response).await;
+            Ok(json_body(response).await?["display_name"].as_str().unwrap_or_default().to_owned())
+        }
+        Err(Error::Unauthorized(message)) => {
+            state.lock().creds.cookies.clear();
+            state.persist().await;
+            Err(Error::Unauthorized(message))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether chat is possible: the API server must accept Runs and stream their events.
+#[tauri::command]
+async fn capabilities(state: State<'_, AppState>) -> Result<bool, Error> {
+    let request = state.api(Method::GET, &["v1", "capabilities"], &[])?;
+    let body = json_body(send(&state.client, request).await?).await?;
+    let on = |feature: &str| body["features"][feature].as_bool().unwrap_or(false);
+    state.lock().run_stop = on("run_stop");
+    Ok(on("run_submission") && on("run_events_sse"))
+}
+
+#[derive(Serialize)]
+struct KeyAccepted {
+    runs: bool,
+    saved: bool,
+}
+
+/// Keeps the key only if `/v1/capabilities` accepts it.
+#[tauri::command]
+async fn set_api_key(state: State<'_, AppState>, key: String) -> Result<KeyAccepted, Error> {
+    let previous = state.lock().creds.api_key.replace(key.trim().to_owned());
+    match capabilities(state.clone()).await {
+        Ok(runs) => Ok(KeyAccepted { runs, saved: state.persist().await }),
+        Err(e) => {
+            state.lock().creds.api_key = previous;
+            Err(e)
+        }
+    }
+}
+
+#[tauri::command]
+fn finish_pairing(state: State<'_, AppState>) -> Result<(), Error> {
+    let settings = {
+        let inner = state.lock();
+        let gateway = inner.gateway.as_ref().ok_or_else(not_configured)?;
+        Settings { dashboard_url: gateway.dashboard.to_string(), api_url: gateway.api.to_string() }
+    };
+    let write = || -> std::io::Result<()> {
+        std::fs::create_dir_all(state.settings_path.parent().expect("settings file has a parent"))?;
+        std::fs::write(&state.settings_path, serde_json::to_vec_pretty(&settings).expect("serializable"))
+    };
+    write().map_err(|e| Error::Invalid(format!("Could not save settings: {e}")))
+}
+
+#[tauri::command]
+async fn list_sessions(state: State<'_, AppState>) -> Result<Value, Error> {
+    // ponytail: newest 100 only, no paging; add offset paging when 100 stops being enough.
+    let request = state.api(Method::GET, &["api", "sessions"], &[("limit", "100")])?;
+    Ok(json_body(send(&state.client, request).await?).await?["data"].take())
+}
+
+#[tauri::command]
+async fn session_messages(state: State<'_, AppState>, id: String) -> Result<Value, Error> {
+    let request = state.api(Method::GET, &["api", "sessions", &id, "messages"], &[])?;
+    Ok(json_body(send(&state.client, request).await?).await?["data"].take())
+}
+
+#[tauri::command]
+async fn delete_session(state: State<'_, AppState>, id: String) -> Result<(), Error> {
+    send(&state.client, state.api(Method::DELETE, &["api", "sessions", &id], &[])?).await?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct RunStarted {
+    run_id: String,
+    session_id: String,
+}
+
+/// Creates a Run. Without a `session_id` the API server starts a new Session keyed by the run id.
+#[tauri::command]
+async fn start_run(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+    text: String,
+    files: Vec<PathBuf>,
+) -> Result<RunStarted, Error> {
+    if let Some(stray) = files.iter().find(|f| !state.dropped.lock().unwrap().contains(*f)) {
+        return Err(Error::Invalid(format!("{} was not dropped into this window", stray.display())));
+    }
+    let mut body = json!({ "input": attach::build_input(&text, &files).map_err(Error::Invalid)? });
+    if let Some(id) = &session_id {
+        body["session_id"] = json!(id);
+    }
+    let request = state.api(Method::POST, &["v1", "runs"], &[])?.json(&body);
+    let response = json_body(send(&state.client, request).await?).await?;
+    let run_id = response["run_id"].as_str().ok_or_else(|| Error::Http("Run created without a run_id".into()))?;
+    Ok(RunStarted { session_id: session_id.unwrap_or_else(|| run_id.to_owned()), run_id: run_id.to_owned() })
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StreamMsg {
+    Event { data: Value },
+    Dropped { message: String },
+}
+
+const TERMINAL_EVENTS: [&str; 4] = ["run.completed", "run.failed", "run.cancelled", "run.interrupted"];
+
+/// Opens a Run's event stream after `last_seq` (-1 = from the start). A gone Run is `NotFound`,
+/// which the UI uses to fall back to a fresh Run.
+#[tauri::command]
+async fn stream_run(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    run_id: String,
+    last_seq: i64,
+    on_event: Channel<StreamMsg>,
+) -> Result<(), Error> {
+    let request = state
+        .api(Method::GET, &["v1", "runs", &run_id, "events"], &[])?
+        .header(header::ACCEPT, "text/event-stream")
+        .header("Last-Event-ID", last_seq.to_string());
+    let response = send(&state.client, request).await?;
+    let mut streams = state.streams.lock().unwrap();
+    let id = run_id.clone();
+    let task = async_runtime::spawn(async move {
+        pump(response, &on_event).await;
+        app.state::<AppState>().streams.lock().unwrap().remove(&id);
+    });
+    if let Some(old) = streams.insert(run_id, task) {
+        old.abort();
+    }
+    Ok(())
+}
+
+/// Forwards every event to the UI until a terminal one. Any other ending is a dropped stream.
+async fn pump(mut response: Response, channel: &Channel<StreamMsg>) {
+    let mut parser = sse::Parser::default();
+    let message = loop {
+        match response.chunk().await {
+            Ok(Some(bytes)) => {
+                for event in parser.push(&bytes) {
+                    let Ok(mut data) = serde_json::from_str::<Value>(&event.data) else { continue };
+                    // Runs frames carry the name inside the JSON; named `event:` frames are normalized to match.
+                    if let (Some(name), Some(fields)) = (event.event, data.as_object_mut()) {
+                        fields.entry("event").or_insert(name.into());
+                    }
+                    let terminal = data["event"].as_str().is_some_and(|e| TERMINAL_EVENTS.contains(&e));
+                    if channel.send(StreamMsg::Event { data }).is_err() || terminal {
+                        return;
+                    }
+                }
+            }
+            Ok(None) => break "The gateway closed the stream before the run finished".to_owned(),
+            Err(e) if e.is_timeout() => {
+                break format!("No data from the gateway for {} s", gateway::IDLE_TIMEOUT.as_secs())
+            }
+            Err(e) => break describe(&e),
+        }
+    };
+    eprintln!("[gateway] run stream dropped: {message}");
+    let _ = channel.send(StreamMsg::Dropped { message });
+}
+
+/// Stops the Turn at once by dropping its stream, then asks the server to stop the Run.
+#[tauri::command]
+async fn stop_run(state: State<'_, AppState>, run_id: String) -> Result<(), Error> {
+    if let Some(task) = state.streams.lock().unwrap().remove(&run_id) {
+        task.abort();
+    }
+    if state.lock().run_stop {
+        let request = state.api(Method::POST, &["v1", "runs", &run_id, "stop"], &[])?;
+        let client = state.client.clone();
+        async_runtime::spawn(async move { send(&client, request).await });
+    }
+    Ok(())
+}
+
+fn main() {
+    tauri::Builder::default()
+        .setup(|app| {
+            let settings_path = app.path().app_config_dir()?.join("settings.json");
+            let gateway = load_gateway(&settings_path);
+            app.manage(AppState {
+                client: gateway::client(),
+                settings_path,
+                inner: Mutex::new(Inner { gateway, ..Inner::default() }),
+                streams: Mutex::default(),
+                dropped: Mutex::default(),
+            });
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
+                window.state::<AppState>().dropped.lock().unwrap().extend(paths.iter().cloned());
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            init,
+            configure,
+            status,
+            sign_in,
+            check_sign_in,
+            capabilities,
+            set_api_key,
+            finish_pairing,
+            list_sessions,
+            session_messages,
+            delete_session,
+            start_run,
+            stream_run,
+            stop_run,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running Hermes Desktop");
+}

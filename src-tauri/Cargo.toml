@@ -1,0 +1,18 @@
+[package]
+name = "hermes-desktop"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# All gateway HTTP + SSE (ADR 0001); rustls uses the platform trust store, no custom cert handling.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+# OS keyring: Secret Service (Linux), Keychain (macOS), Credential Manager (Windows).
+keyring = "4"
+# Image attachments are sent as base64 data URLs.
+base64 = "0.22"
