@@ -1,7 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { field, h, input } from "./dom";
-import { applyAppearance } from "./appearance";
+import { field, h, icon, input } from "./dom";
+import { appearanceTab, applyAppearance } from "./appearance";
 
 type GatewayError = { kind: "unreachable" | "unauthorized" | "not_found" | "http" | "invalid"; message: string };
 type Init = { dashboard_url: string | null; api_url: string | null; ssh_host: string | null; keyring: boolean };
@@ -341,7 +341,8 @@ function showChat(supported: boolean, ssh = false) {
       "div",
       { className: "chat" },
       h("aside", {}, h("div", { className: "row" }, h("h2", { textContent: "Sessions" }),
-        h("button", { className: "secondary", textContent: "New chat", onclick: newChat })), ui.sessionsError, ui.sessions),
+        h("button", { className: "secondary", textContent: "New chat", onclick: newChat })), ui.sessionsError, ui.sessions,
+        h("footer", {}, h("button", { className: "icon-btn", title: "Settings", onclick: showSettings }, icon("settings"), "Settings"))),
       h("main", {}, ui.turns, ui.pending, h("div", { className: "composer" }, box, button)),
       ui.drop,
     ),
@@ -349,6 +350,20 @@ function showChat(supported: boolean, ssh = false) {
   newChat();
   updateComposer();
   refreshSessions();
+}
+
+/** Settings replaces the chat view until closed; the chat keeps running underneath. */
+function showSettings() {
+  const chat = app.querySelector<HTMLElement>(".chat")!;
+  const view = h(
+    "div",
+    { className: "settings" },
+    h("nav", {}, h("h2", { textContent: "Settings" }), h("button", { textContent: "Appearance", ariaCurrent: "page" }),
+      h("button", { className: "secondary", textContent: "Back to chat", onclick: () => { view.remove(); chat.hidden = false; } })),
+    appearanceTab(),
+  );
+  chat.hidden = true;
+  app.append(view);
 }
 
 getCurrentWebview().onDragDropEvent(({ payload }) => {
