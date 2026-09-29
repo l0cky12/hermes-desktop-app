@@ -41,7 +41,8 @@ const dialog = document.querySelector<HTMLDialogElement>("#reauth")!;
 dialog.addEventListener("cancel", (e) => e.preventDefault()); // re-auth can't be dismissed, only completed
 
 const asError = (e: unknown): GatewayError =>
-  typeof e === "object" && e !== null && "kind" in e ? (e as GatewayError) : { kind: "invalid", message: String(e) };
+  typeof e === "object" && e !== null && "kind" in e ? (e as GatewayError)
+  : { kind: "invalid", message: e instanceof Error ? e.message : String(e) };
 
 const basename = (path: string) => path.split(/[\\/]/).pop() ?? path;
 const attachmentName = (a: Attachment) => ("path" in a ? basename(a.path) : a.name);
@@ -508,7 +509,7 @@ async function pasteImages(e: ClipboardEvent) {
       const ext = fitted.type === "image/jpeg" ? "jpg" : fitted.type.split("/")[1];
       pending.push({ name: `Pasted image ${++pasted}.${ext}`, data_url: await dataUrl(fitted) });
     } catch (err) {
-      ui!.composerError.textContent = `Not attached: ${err instanceof Error ? err.message : String(err)}`;
+      ui!.composerError.textContent = `Not attached: ${asError(err).message}`;
     }
   }
   renderPending();
@@ -524,7 +525,7 @@ async function toggleDictation() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch (e) {
-    ui!.composerError.textContent = `Microphone unavailable: ${e instanceof Error ? e.message : String(e)}`;
+    ui!.composerError.textContent = `Microphone unavailable: ${asError(e).message}`;
     return;
   }
   const rec = new MediaRecorder(stream);
