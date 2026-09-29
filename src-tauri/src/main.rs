@@ -1,6 +1,7 @@
 mod acp;
 mod attach;
 mod gateway;
+mod picker;
 mod sse;
 
 use gateway::{absorb_cookies, cookie_header, describe, endpoint, parse_origin, send, Error};
