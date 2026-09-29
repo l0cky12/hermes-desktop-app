@@ -447,6 +447,22 @@ async fn set_profile(state: State<'_, AppState>, name: String) -> Result<(), Err
     Ok(())
 }
 
+/// Set-up providers and their models for the current Profile.
+#[tauri::command]
+async fn list_models(state: State<'_, AppState>) -> Result<picker::Models, Error> {
+    if state.ssh() {
+        let hermes = state.hermes().await?;
+        if let Some(models) = hermes.models() {
+            return Ok(picker::from_acp(&models));
+        }
+        // ponytail: an unused Session per connection; Hermes never lists one with no messages.
+        let created = hermes.request("session/new", json!({ "cwd": hermes.home, "mcpServers": [] })).await?;
+        return Ok(picker::from_acp(&created["models"]));
+    }
+    let request = state.api(Method::GET, &["api", "model", "options"], &[])?;
+    Ok(picker::from_options(&json_body(send(&state.client, request).await?).await?))
+}
+
 /// Answers an Approval request from Hermes over SSH; `None` denies by cancelling.
 #[tauri::command]
 async fn answer_permission(
@@ -524,7 +540,10 @@ async fn start_run(
     session_id: Option<String>,
     text: String,
     files: Vec<PathBuf>,
+    model: Option<picker::ModelChoice>,
+    reasoning: Option<String>,
 ) -> Result<RunStarted, Error> {
+    let reasoning = reasoning.map(|r| picker::valid_reasoning(&r)).transpose()?;
     if let Some(stray) = files.iter().find(|f| !state.dropped.lock().unwrap().contains(*f)) {
         return Err(Error::Invalid(format!("{} was not dropped into this window", stray.display())));
     }
@@ -538,16 +557,14 @@ async fn start_run(
                 created["sessionId"].as_str().ok_or_else(|| Error::Http("Session created without an id".into()))?.to_owned()
             }
         };
+        hermes.use_model(&session, model.as_ref()).await?;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let run_id = format!("acp-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let run = AcpRun { session: session.clone(), prompt: Some(acp::prompt_blocks(input)) };
         state.acp_runs.lock().unwrap().insert(run_id.clone(), run);
         return Ok(RunStarted { run_id, session_id: session });
     }
-    let mut body = json!({ "input": input });
-    if let Some(id) = &session_id {
-        body["session_id"] = json!(id);
-    }
+    let body = picker::run_body(input, session_id.as_deref(), model.as_ref(), reasoning.as_deref());
     let request = state.api(Method::POST, &["v1", "runs"], &[])?.json(&body);
     let response = json_body(send(&state.client, request).await?).await?;
     let run_id = response["run_id"].as_str().ok_or_else(|| Error::Http("Run created without a run_id".into()))?;
@@ -747,6 +764,7 @@ fn main() {
             connect_ssh,
             list_profiles,
             set_profile,
+            list_models,
             answer_permission,
             list_sessions,
             session_messages,

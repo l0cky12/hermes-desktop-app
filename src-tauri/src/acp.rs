@@ -3,7 +3,7 @@
 //! is a secret, and the remote Hermes owns all Session state.
 
 use crate::gateway::Error;
-use crate::picker::{parse_profile_list, Profiles};
+use crate::picker::{acp_id, parse_profile_list, ModelChoice, Profiles};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -59,6 +59,10 @@ pub struct Conn {
     pub home: String,
     /// Each listed Session's own cwd, so loading it doesn't move it.
     pub cwds: Mutex<HashMap<String, String>>,
+    /// `models` from the last `session/new` answer: the list and the Profile's default.
+    models: Mutex<Option<Value>>,
+    /// The model id this app last set on each Session.
+    applied: Mutex<HashMap<String, String>>,
     _child: Child,
 }
 
@@ -97,6 +101,8 @@ pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Err
         closed: Mutex::default(),
         home,
         cwds: Mutex::default(),
+        models: Mutex::default(),
+        applied: Mutex::default(),
         _child: child,
     });
     tokio::spawn(read(conn.clone(), lines, stderr));
@@ -224,7 +230,36 @@ impl Conn {
             return Err(Error::Unreachable(self.closed_reason()));
         }
         self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })).await?;
-        rx.await.unwrap_or_else(|_| Err(Error::Unreachable(self.closed_reason())))
+        let result = rx.await.unwrap_or_else(|_| Err(Error::Unreachable(self.closed_reason())));
+        if method == "session/new" {
+            if let Ok(created) = &result {
+                *self.models.lock().unwrap() = Some(created["models"].clone());
+            }
+        }
+        result
+    }
+
+    pub fn models(&self) -> Option<Value> {
+        self.models.lock().unwrap().clone()
+    }
+
+    /// Over SSH the model is Session state: it's switched between Turns, and only when it changes.
+    pub async fn use_model(&self, session: &str, model: Option<&ModelChoice>) -> Result<(), Error> {
+        let applied = self.applied.lock().unwrap().get(session).cloned();
+        let wanted = match model {
+            Some(m) => acp_id(m),
+            // Back to Profile default is needed only if this app moved the Session off it.
+            None => match (&applied, self.models().and_then(|m| m["currentModelId"].as_str().map(str::to_owned))) {
+                (Some(_), Some(default)) => default,
+                _ => return Ok(()),
+            },
+        };
+        if applied.as_deref() == Some(wanted.as_str()) {
+            return Ok(());
+        }
+        self.request("session/set_model", json!({ "sessionId": session, "modelId": wanted })).await?;
+        self.applied.lock().unwrap().insert(session.to_owned(), wanted);
+        Ok(())
     }
 
     /// Routes a Session's updates to the returned receiver until `unsubscribe` or disconnect.

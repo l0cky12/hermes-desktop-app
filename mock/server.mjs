@@ -297,7 +297,8 @@ serve(API_PORT, "api", async (req, res, url) => {
     const { content, text, names } = describeInput(body.input);
     touchSession(sessionId, text.slice(0, 60), profile);
     addMessage(sessionId, "user", content);
-    startRun(runId, sessionId, text, names, profile);
+    const model = body.model ? `${body.provider ?? "?"}/${body.model}` : "profile default";
+    startRun(runId, sessionId, text, names, `${profile} · ${model} · reasoning ${body.model_options?.reasoning_effort ?? "default"}`);
     return send(res, 202, { run_id: runId, status: "started", replayed: false });
   }
   if (a === "v1" && b === "runs" && id) {
@@ -315,6 +316,14 @@ serve(API_PORT, "api", async (req, res, url) => {
       run.wake?.();
       return send(res, 200, { run_id: id, status: "stopping" });
     }
+  }
+  if (route === "GET /api/model/options") {
+    if (env.MOCK_NO_MODELS === "1") return send(res, 500, { error: { message: "Failed to list model options.", code: "model_options_failed" } });
+    return send(res, 200, { provider: "mockai", model: "mock-large", providers: [
+      { slug: "mockai", name: "Mock AI", authenticated: true, models: ["mock-large", "mock-small"] },
+      { slug: "zai", name: "Z.ai", authenticated: true, models: ["glm-5.3-flash"] },
+      { slug: "nous", name: "Nous Portal", authenticated: false, models: ["hermes-5"] },
+    ] });
   }
   if (route === "GET /api/sessions") {
     const limit = Math.min(Number(url.searchParams.get("limit") ?? 50), 200);
