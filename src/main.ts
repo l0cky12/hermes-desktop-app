@@ -889,28 +889,32 @@ async function setupProfiles() {
   await useProfile(start, start === "default" || !list.names.includes("default") ? null : "default");
 }
 
-/** Switches the whole view to a Profile: its Sessions, its API key, and a new chat. */
-async function useProfile(name: string, previous: string | null) {
+/** Switches the whole view to a Profile: its Sessions, its API key, and a new chat, or `session` when going back. */
+async function useProfile(name: string, previous: string | null, session: string | null = null) {
+  const back = sessionId; // where "Back to <previous>" returns
   await leave()?.catch(() => {}); // the Stop must reach the old Profile before requests switch to the new one
   try {
     await invoke("set_profile", { name });
     if (!overSsh) {
       const supported = await profileKey(name, previous);
-      if (supported === null) return void (previous && (await useProfile(previous, null)));
+      if (supported === null) return void (previous && (await useProfile(previous, null, back)));
       setRuns(supported);
     }
   } catch (e) {
     ui!.sessionsError.textContent = `Couldn't open the ${name} profile: ${asError(e).message}`;
-    if (previous) await useProfile(previous, null);
+    if (previous) await useProfile(previous, null, back);
     return;
+  }
+  if (name !== profile) {
+    pending = []; // Attachments stay with the Profile they were added under
+    renderPending();
   }
   profile = name;
   ui!.profile.value = name;
   saveProfile(localStorage, connection, name);
   ui!.sessionsError.textContent = "";
-  pending = [];
-  renderPending();
-  newChat();
+  if (session) void openSession(session);
+  else newChat();
   await Promise.all([refreshSessions(), refreshModels()]);
 }
 
