@@ -327,7 +327,7 @@ serve(API_PORT, "api", async (req, res, url) => {
       return send(res, 200, { run_id: id, status: "stopping" });
     }
   }
-  if (route === "GET /api/model/options") {
+  if (req.method === "GET" && url.pathname === "/api/model/options") {
     if (env.MOCK_NO_MODELS === "1") return send(res, 500, { error: { message: "Failed to list model options.", code: "model_options_failed" } });
     return send(res, 200, { provider: "mockai", model: "mock-large", providers: [
       { slug: "mockai", name: "Mock AI", authenticated: true, models: ["mock-large", "mock-small"] },
