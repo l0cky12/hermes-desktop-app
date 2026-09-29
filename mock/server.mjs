@@ -6,6 +6,7 @@
 //
 // Prompt keywords script the reply: "tool" (tool events), "idle" (12 s silence, so a 10 s
 // keepalive fires mid-stream), "slow" (long, slow reply for kill tests), "approval", "fail".
+// MOCK_TRANSCRIBE_MS delays speech-to-text (try 20000 to outlast the 15 s idle timeout).
 // Profiles: default (MOCK_KEY), orchestrator (hd-orch-key-7d3e9a1c5b), coder (no key).
 import http from "node:http";
 import { randomBytes } from "node:crypto";
@@ -125,6 +126,15 @@ serve(DASH_PORT, "dashboard", async (req, res, url) => {
     return send(res, 200, { profiles: PROFILES.map((name) => ({ name, is_default: name === "default" })) });
   }
   if (route === "GET /api/profiles/active") return send(res, 200, { active: "orchestrator", current: "default" });
+  if (route === "POST /api/audio/transcribe") {
+    const body = await readJson(req);
+    if (!body?.data_url?.startsWith("data:audio/") && !body?.data_url?.startsWith("data:video/webm")) {
+      return send(res, 400, { detail: "Payload must be an audio recording" });
+    }
+    await new Promise((resolve) => setTimeout(resolve, Number(env.MOCK_TRANSCRIBE_MS ?? 800)));
+    const profileName = url.searchParams.get("profile") ?? "default";
+    return send(res, 200, { ok: true, transcript: `hello from the mock microphone (${profileName})`, provider: "mock" });
+  }
   send(res, 404, { detail: "Not Found" });
 });
 

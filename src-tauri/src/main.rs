@@ -86,6 +86,7 @@ impl Inner {
 
 struct AppState {
     client: reqwest::Client,
+    slow_client: reqwest::Client,
     settings_path: PathBuf,
     inner: Mutex<Inner>,
     streams: Mutex<HashMap<String, async_runtime::JoinHandle<()>>>,
@@ -463,6 +464,16 @@ async fn list_models(state: State<'_, AppState>) -> Result<picker::Models, Error
     Ok(picker::from_options(&json_body(send(&state.client, request).await?).await?))
 }
 
+/// Dictation: the Dashboard transcribes with the current Profile's speech-to-text settings.
+#[tauri::command]
+async fn transcribe(state: State<'_, AppState>, data_url: String) -> Result<String, Error> {
+    let profile = state.lock().profile.clone();
+    let query: Vec<(&str, &str)> = profile.as_deref().map(|p| vec![("profile", p)]).unwrap_or_default();
+    let request = state.dashboard(Method::POST, &["api", "audio", "transcribe"], &query)?.json(&json!({ "data_url": data_url }));
+    let body = json_body(send(&state.slow_client, request).await?).await?;
+    Ok(body["transcript"].as_str().unwrap_or_default().to_owned())
+}
+
 /// Answers an Approval request from Hermes over SSH; `None` denies by cancelling.
 #[tauri::command]
 async fn answer_permission(
@@ -730,6 +741,7 @@ fn main() {
             let gateway = settings.as_ref().filter(|_| ssh_host.is_none()).and_then(|s| load_gateway(s, &settings_path));
             app.manage(AppState {
                 client: gateway::client(),
+                slow_client: gateway::slow_client(),
                 settings_path,
                 inner: Mutex::new(Inner { gateway, ssh_host, ..Inner::default() }),
                 streams: Mutex::default(),
@@ -772,6 +784,7 @@ fn main() {
             list_profiles,
             set_profile,
             list_models,
+            transcribe,
             answer_permission,
             list_sessions,
             session_messages,

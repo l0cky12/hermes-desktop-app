@@ -20,15 +20,21 @@ pub enum Error {
     Invalid(String),
 }
 
-pub fn client() -> Client {
+fn builder() -> reqwest::ClientBuilder {
     Client::builder()
         // Never route credentials through a proxy host or follow a redirect off the gateway.
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
-        .read_timeout(IDLE_TIMEOUT)
-        .build()
-        .expect("static client config")
+}
+
+pub fn client() -> Client {
+    builder().read_timeout(IDLE_TIMEOUT).build().expect("static client config")
+}
+
+/// For a reply the server works on silently (speech-to-text): no idle cutoff, 2 min in total.
+pub fn slow_client() -> Client {
+    builder().timeout(Duration::from_secs(120)).build().expect("static client config")
 }
 
 /// Accepts `http(s)://host[:port]` only: no credentials, path, query, or fragment.
