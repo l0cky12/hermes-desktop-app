@@ -2,6 +2,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { field, h, icon, input } from "./dom";
 import { appearanceTab, applyAppearance } from "./appearance";
+import { saveProfile, startProfile } from "./prefs";
 
 type GatewayError = { kind: "unreachable" | "unauthorized" | "not_found" | "http" | "invalid"; message: string };
 type Init = { dashboard_url: string | null; api_url: string | null; ssh_host: string | null; keyring: boolean };
@@ -54,6 +55,7 @@ async function boot() {
   app.replaceChildren(h("p", { className: "loading", textContent: "Opening the OS keyring… (unlock it if your system asks)" }));
   const init = await invoke<Init>("init");
   noteSaved(init.keyring);
+  connection = init.ssh_host ? `ssh:${init.ssh_host}` : init.dashboard_url && init.api_url ? connectionId(init.dashboard_url, init.api_url) : "";
   if (init.ssh_host) await connectSsh();
   else if (init.dashboard_url && init.api_url) await connect();
   else showPairing();
@@ -76,7 +78,7 @@ async function connect() {
       supported = await invoke<boolean>("capabilities");
     } catch (e) {
       if (asError(e).kind !== "unauthorized") throw e;
-      supported = (await reauth("key", "The API server did not accept the saved API key."))!;
+      supported = (await reauth("key", "The API server did not accept the saved API key.")) ?? false;
     }
     showChat(supported);
   } catch (e) {
@@ -190,6 +192,7 @@ function showPairing() {
         }
         noteSaved(accepted.saved);
         await invoke("finish_pairing");
+        connection = connectionId(dashUrl.value, apiUrl.value);
         showChat(accepted.runs);
       } catch (e) {
         formError.textContent = asError(e).message;
@@ -220,6 +223,7 @@ function showPairing() {
     sshResult.textContent = "Connecting…";
     try {
       await invoke("configure_ssh", { host: sshHost.value });
+      connection = `ssh:${sshHost.value.trim()}`;
       showChat(true, true);
     } catch (e) {
       sshResult.className = "error";
@@ -244,8 +248,9 @@ function showPairing() {
   );
 }
 
-/** Blocks until the rejected credential is replaced. For a new key, resolves with whether chat is supported. */
-function reauth(kind: "sign-in" | "key", reason: string): Promise<boolean | undefined> {
+/** Blocks until the rejected credential is replaced. For a new key, resolves with whether chat is supported;
+ *  with `cancel`, the prompt can also be left, resolving `null`. */
+function reauth(kind: "sign-in" | "key", reason: string, cancel?: string): Promise<boolean | undefined | null> {
   return new Promise((resolve) => {
     const user = input({ autocomplete: "username" });
     const pass = input({ type: "password" });
@@ -262,9 +267,10 @@ function reauth(kind: "sign-in" | "key", reason: string): Promise<boolean | unde
       h("div", { className: "row" }, submit, h("button", {
         type: "button",
         className: "secondary",
-        textContent: "Use a different gateway",
+        textContent: cancel ?? "Use a different gateway",
         onclick: () => {
           dialog.close();
+          if (cancel) return resolve(null);
           showPairing();
         },
       })),
@@ -303,6 +309,9 @@ function reauth(kind: "sign-in" | "key", reason: string): Promise<boolean | unde
 // ---- Chat ----
 
 let runs = false; // the API server accepts Runs and streams their events
+let connection = ""; // which Gateway or SSH host; Profiles and per-Session choices are remembered per connection
+let profile = "default";
+const connectionId = (dash: string, api: string) => `${new URL(dash).origin}|${new URL(api).origin}`;
 let overSsh = false; // Hermes over SSH (hermes acp): Approvals can be answered, Sessions can't be deleted
 let sessionId: string | null = null;
 let active: Turn | null = null;
@@ -318,6 +327,7 @@ let ui: {
   composerError: HTMLElement;
   toolbar: HTMLElement;
   spacer: HTMLElement;
+  profile: HTMLSelectElement;
 } | null = null;
 
 function showChat(supported: boolean, ssh = false) {
@@ -335,6 +345,7 @@ function showChat(supported: boolean, ssh = false) {
     composerError: h("p", { className: "error" }),
     toolbar: h("div", { className: "toolbar" }),
     spacer: h("span", { className: "spacer" }),
+    profile: h("select", { title: "Profile" }),
   };
   const { input: box, send: button } = ui;
   const picker = h("input", { type: "file", multiple: true, hidden: true });
@@ -346,6 +357,8 @@ function showChat(supported: boolean, ssh = false) {
   paperclip.disabled = !runs;
   ui.toolbar.append(paperclip, picker, ui.spacer, button);
   box.onpaste = (e) => void pasteImages(e);
+  ui.profile.onchange = () => void useProfile(ui!.profile.value, profile);
+  ui.toolbar.insertBefore(h("span", { className: "picker profile", title: "Profile" }, icon("user"), ui.profile), ui.spacer);
   box.onkeydown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -366,7 +379,7 @@ function showChat(supported: boolean, ssh = false) {
   );
   newChat();
   updateComposer();
-  refreshSessions();
+  void setupProfiles();
 }
 
 /** Settings replaces the chat view until closed; the chat keeps running underneath. */
@@ -595,8 +608,8 @@ async function beginRun(turn: Turn) {
   }
 }
 
-function setRuns(next: boolean | undefined) {
-  if (next !== undefined) runs = next;
+function setRuns(next: boolean | undefined | null) {
+  if (typeof next === "boolean") runs = next;
   updateComposer();
 }
 
@@ -761,5 +774,57 @@ async function refreshSessions() {
   );
   markCurrent();
 }
+
+/** Fills the Profile selector and opens this connection's starting Profile. */
+async function setupProfiles() {
+  let list: { names: string[]; active: string | null };
+  try {
+    list = await invoke("list_profiles");
+  } catch (e) {
+    ui!.sessionsError.textContent = `Couldn't list profiles: ${asError(e).message}`;
+    list = { names: ["default"], active: null };
+  }
+  if (!list.names.length) list.names = ["default"];
+  ui!.profile.replaceChildren(...list.names.map((n) => h("option", { value: n, textContent: n })));
+  const start = startProfile(localStorage, connection, list.names, list.active);
+  await useProfile(start, start === "default" || !list.names.includes("default") ? null : "default");
+}
+
+/** Switches the whole view to a Profile: its Sessions, its API key, and a new chat. */
+async function useProfile(name: string, previous: string | null) {
+  leave();
+  try {
+    await invoke("set_profile", { name });
+    if (!overSsh) {
+      const supported = await profileKey(name, previous);
+      if (supported === null) return void (previous && (await useProfile(previous, null)));
+      setRuns(supported);
+    }
+  } catch (e) {
+    ui!.sessionsError.textContent = `Couldn't open the ${name} profile: ${asError(e).message}`;
+    if (previous) await useProfile(previous, null);
+    return;
+  }
+  profile = name;
+  ui!.profile.value = name;
+  saveProfile(localStorage, connection, name);
+  ui!.sessionsError.textContent = "";
+  newChat();
+  await Promise.all([refreshSessions(), refreshModels()]);
+}
+
+/** Over HTTP each named Profile has its own API key: asks once, and the keyring keeps it. `null` = went back. */
+async function profileKey(name: string, previous: string | null): Promise<boolean | null> {
+  try {
+    return await invoke<boolean>("capabilities");
+  } catch (e) {
+    if (asError(e).kind !== "unauthorized") throw e;
+    const reason = `The ${name} profile has its own API key (API_SERVER_KEY in that profile's .env). Enter it once; it's saved with your other credentials.`;
+    const supported = await reauth("key", reason, previous ? `Back to ${previous}` : undefined);
+    return supported === null ? null : supported ?? false;
+  }
+}
+
+async function refreshModels() {} // filled in by the model picker
 
 boot();
