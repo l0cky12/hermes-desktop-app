@@ -971,10 +971,11 @@ function toggleModelMenu() {
     const groups = models.groups
       .map((g) => ({ ...g, models: g.models.filter((m) => `${g.name} ${m}`.toLowerCase().includes(q)) }))
       .filter((g) => g.models.length);
+    const fallback = modelLabel(null).toLowerCase().includes(q) ? [item(modelLabel(null), null)] : [];
     list.replaceChildren(
-      ...(q ? [] : [item(modelLabel(null), null)]),
+      ...fallback,
       ...groups.flatMap((g) => [h("h3", { textContent: g.name }), ...g.models.map((m) => item(m, { provider: g.provider, model: m }))]),
-      ...(groups.length ? [] : [h("p", { textContent: q ? "No matching models" : modelPicker.title })]),
+      ...(groups.length || (q && fallback.length) ? [] : [h("p", { textContent: q ? "No matching models" : modelPicker.title })]),
     );
   };
   search.oninput = render;
