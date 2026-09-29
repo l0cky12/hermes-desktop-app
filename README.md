@@ -97,8 +97,9 @@ Every request goes directly to the configured gateway: system proxies are ignore
 The API server has no upload endpoint, so Attachments ride inside the Run request. Drop files on the window, pick them with the paperclip, or paste an image.
 - Text files are inlined as fenced text.
 - Images (`png`, `jpg`, `gif`, `webp`) are sent as `image_url` data-URL parts.
-- Other file types, and files over 2 MB, are refused with an inline "Not sent" error.
-- Pasted images over 2 MB, or in a format that can't be sent, are re-encoded as JPEG and scaled down until they fit.
+- All of a Turn's Attachments together may total 7 MB: the API server refuses requests over 10 MB, and images grow by a third when base64-encoded. SSH gets the same budget.
+- Images (dropped, picked, or pasted) that don't fit what's left of the budget, or are in a format that can't be sent, are re-encoded as JPEG and scaled down until they fit.
+- Other file types, and text files that don't fit the budget, are refused with an inline error ("Not attached" when added, or "Not sent" for a dropped file, which is only measured when the Turn is sent).
 
 ## Testing against the mock gateway
 

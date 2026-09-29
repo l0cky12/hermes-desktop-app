@@ -439,11 +439,22 @@ function showSettings() {
 getCurrentWebview().onDragDropEvent(({ payload }) => {
   if (!ui) return;
   ui.drop.hidden = payload.type === "drop" || payload.type === "leave";
-  if (payload.type === "drop" && runs) {
-    pending.push(...payload.paths.filter((p) => !pending.some((a) => "path" in a && a.path === p)).map((path) => ({ path })));
-    renderPending();
-  }
+  if (payload.type === "drop" && runs) void addDropped(payload.paths.filter((p) => !pending.some((a) => "path" in a && a.path === p)));
 });
+
+/** Dropped images come into the webview to be shrunk to fit; other files stay paths for attach.rs to read. */
+async function addDropped(paths: string[]) {
+  for (const path of paths) {
+    try {
+      const url = await invoke<string | null>("read_dropped", { path });
+      if (url) await addImage(basename(path), blobOf(url));
+      else pending.push({ path });
+    } catch (err) {
+      ui!.composerError.textContent = `Not attached: ${asError(err).message}`;
+    }
+  }
+  renderPending();
+}
 
 /** An Attachment chip: a thumbnail for images the webview holds, a paperclip otherwise. */
 function chip(a: Attachment, onRemove?: () => void): HTMLElement {
@@ -462,9 +473,14 @@ function renderPending() {
   );
 }
 
-const MAX_BYTES = 2 * 1024 * 1024; // attach.rs enforces it; checked here only to avoid reading huge files
+const MAX_TOTAL_BYTES = 7_000_000; // for all of a Turn's Attachments together; attach.rs enforces it and says why
 const SENDABLE = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+const OVER_BUDGET = "takes the Attachments over the 7 MB a Turn can carry";
 let pasted = 0;
+
+/** What's left of the budget; dropped non-image files aren't counted here, attach.rs catches those at send. */
+const budgetLeft = () =>
+  pending.reduce((left, a) => left - ("data_url" in a ? Math.floor(((a.data_url.length - a.data_url.indexOf(",") - 1) * 3) / 4) : 0), MAX_TOTAL_BYTES);
 
 const dataUrl = (blob: Blob) =>
   new Promise<string>((resolve, reject) => {
@@ -474,28 +490,46 @@ const dataUrl = (blob: Blob) =>
     reader.readAsDataURL(blob);
   });
 
+// Not fetch(): the CSP's connect-src has no data:.
+function blobOf(url: string) {
+  const [head, data] = url.split(",");
+  return new Blob([Uint8Array.from(atob(data), (c) => c.charCodeAt(0))], { type: head.slice(5, head.indexOf(";")) });
+}
+
 async function addFiles(files: File[]) {
   for (const file of files) {
-    if (file.size > MAX_BYTES) ui!.composerError.textContent = `Not attached: ${file.name} is larger than 2 MB`;
-    else pending.push({ name: file.name, data_url: await dataUrl(file) });
+    try {
+      if (file.type.startsWith("image/")) await addImage(file.name, file);
+      else if (file.size > budgetLeft()) throw new Error(`${file.name} ${OVER_BUDGET}`); // not worth reading
+      else pending.push({ name: file.name, data_url: await dataUrl(file) });
+    } catch (err) {
+      ui!.composerError.textContent = `Not attached: ${asError(err).message}`;
+    }
   }
   renderPending();
 }
 
-/** Screenshots are often over 2 MB or an unsendable type: re-encode as JPEG, shrinking until one fits. */
-async function fitImage(blob: Blob): Promise<Blob> {
-  if (blob.size <= MAX_BYTES && SENDABLE.includes(blob.type)) return blob;
+/** Adds an image, re-encoded as JPEG if it had to be shrunk (the name's extension follows, attach.rs reads it). */
+async function addImage(name: string, image: Blob) {
+  const fitted = await fitImage(name, image, budgetLeft());
+  if (fitted !== image) name = `${name.replace(/\.[^.]*$/, "")}.jpg`;
+  pending.push({ name, data_url: await dataUrl(fitted) });
+}
+
+/** Photos and screenshots are often too big, or an unsendable type: re-encode as JPEG, shrinking until one fits. */
+async function fitImage(name: string, blob: Blob, limit: number): Promise<Blob> {
+  if (blob.size <= limit && SENDABLE.includes(blob.type)) return blob;
   const bitmap = await createImageBitmap(blob);
-  for (const scale of [1, 0.75, 0.5, 0.35]) {
+  for (const scale of [1, 0.75, 0.5, 0.35, 0.25]) {
     const canvas = h("canvas", { width: Math.round(bitmap.width * scale), height: Math.round(bitmap.height * scale) });
     const ctx = canvas.getContext("2d")!;
     ctx.fillStyle = "#fff"; // JPEG has no transparency
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
     const jpeg = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
-    if (jpeg && jpeg.size <= MAX_BYTES) return jpeg;
+    if (jpeg && jpeg.size <= limit) return jpeg;
   }
-  throw new Error("the pasted image is too large even after compressing");
+  throw new Error(`${name} ${OVER_BUDGET}, even after shrinking it`);
 }
 
 /** Pasted images become Attachments; any text in the clipboard still pastes as usual. */
@@ -507,9 +541,7 @@ async function pasteImages(e: ClipboardEvent) {
   if (!images.length || !runs) return;
   for (const image of images) {
     try {
-      const fitted = await fitImage(image);
-      const ext = fitted.type === "image/jpeg" ? "jpg" : fitted.type.split("/")[1];
-      pending.push({ name: `Pasted image ${++pasted}.${ext}`, data_url: await dataUrl(fitted) });
+      await addImage(`Pasted image ${++pasted}.${image.type.split("/")[1]}`, image);
     } catch (err) {
       ui!.composerError.textContent = `Not attached: ${asError(err).message}`;
     }
