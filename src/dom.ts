@@ -32,7 +32,8 @@ const ICONS = {
 };
 export type IconName = keyof typeof ICONS;
 
+/** `size` is px at the Default font size; icons scale with the Font size setting. */
 export function icon(name: IconName, size = 16): SVGSVGElement {
-  const markup = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
+  const markup = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="${size / 14}rem" height="${size / 14}rem" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
   return document.importNode(new DOMParser().parseFromString(markup, "image/svg+xml").documentElement as unknown as SVGSVGElement, true);
 }
