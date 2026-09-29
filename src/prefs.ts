@@ -5,7 +5,7 @@ export type ModelChoice = { provider: string; model: string };
 export type Choice = { model: ModelChoice | null; reasoning: string | null };
 export type Appearance = { theme: "system" | "light" | "dark"; skin: string; fontSize: "small" | "default" | "large" };
 
-export const REASONING_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+export const REASONING_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 export const SKINS = [
   "default", "ares", "mono", "slate", "poseidon", "sisyphus", "charizard", "sienna", "catppuccin", "nous", "geist-contrast", "zeus",
 ];

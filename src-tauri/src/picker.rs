@@ -134,7 +134,7 @@ pub fn from_acp(state: &Value) -> Models {
 }
 
 /// The ladder the API server accepts (gateway/platforms/api_server.py `_REASONING_EFFORTS`).
-const REASONING: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const REASONING: [&str; 8] = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 pub fn valid_reasoning(r: &str) -> Result<String, Error> {
     match REASONING.contains(&r) {
@@ -254,6 +254,7 @@ mod tests {
     #[test]
     fn reasoning_levels_are_hermes_values() {
         assert!(valid_reasoning("xhigh").is_ok());
+        assert!(valid_reasoning("ultra").is_ok(), "the top of the gateway's ladder");
         assert!(valid_reasoning("turbo").is_err());
         assert!(valid_reasoning("").is_err());
     }
