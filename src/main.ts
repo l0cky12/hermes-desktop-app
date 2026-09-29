@@ -340,6 +340,8 @@ let ui: {
   modelLabel: HTMLElement;
   menu: HTMLElement;
   reasoning: HTMLSelectElement;
+  mic: HTMLButtonElement;
+  micTime: HTMLElement;
 } | null = null;
 
 function showChat(supported: boolean, ssh = false) {
@@ -357,6 +359,8 @@ function showChat(supported: boolean, ssh = false) {
     composerError: h("p", { className: "error" }),
     toolbar: h("div", { className: "toolbar" }),
     spacer: h("span", { className: "spacer" }),
+    mic: h("button", { type: "button", className: "icon-btn", title: "Dictate" }),
+    micTime: h("span"),
     profile: h("select", { title: "Profile" }),
     modelPicker: h("span", { className: "picker model" }),
     modelLabel: h("span"),
@@ -373,6 +377,11 @@ function showChat(supported: boolean, ssh = false) {
   const paperclip = h("button", { type: "button", className: "icon-btn", title: "Attach files", onclick: () => picker.click() }, icon("paperclip"));
   paperclip.disabled = !runs;
   ui.toolbar.append(paperclip, picker, ui.spacer, button);
+  ui.mic.append(icon("mic"), ui.micTime);
+  ui.mic.onclick = () => void toggleDictation();
+  // Speech-to-text is a Dashboard feature; over SSH there is no Dashboard.
+  ui.mic.hidden = overSsh || !navigator.mediaDevices?.getUserMedia;
+  ui.toolbar.insertBefore(ui.mic, picker.nextSibling);
   box.onpaste = (e) => void pasteImages(e);
   ui.profile.onchange = () => void useProfile(ui!.profile.value, profile);
   ui.toolbar.insertBefore(h("span", { className: "picker profile", title: "Profile" }, icon("user"), ui.profile), ui.spacer);
@@ -501,6 +510,53 @@ async function pasteImages(e: ClipboardEvent) {
     }
   }
   renderPending();
+}
+
+let recorder: MediaRecorder | null = null;
+const clock = (ms: number) => `${Math.floor(ms / 60_000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
+
+/** Dictation: click to record, click again to insert the transcript at the cursor. */
+async function toggleDictation() {
+  if (recorder) return recorder.stop();
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    ui!.composerError.textContent = `Microphone unavailable: ${e instanceof Error ? e.message : String(e)}`;
+    return;
+  }
+  const rec = new MediaRecorder(stream);
+  const chunks: Blob[] = [];
+  const started = Date.now();
+  const tick = setInterval(() => (ui!.micTime.textContent = clock(Date.now() - started)), 250);
+  const limit = setTimeout(() => rec.stop(), 120_000); // ponytail: 2 min cap per note; chunked transcription if longer dictation matters
+  recorder = rec;
+  ui!.mic.dataset.recording = "";
+  ui!.mic.title = "Stop and transcribe";
+  ui!.composerError.textContent = "";
+  rec.ondataavailable = (e) => chunks.push(e.data);
+  rec.onstop = async () => {
+    clearInterval(tick);
+    clearTimeout(limit);
+    stream.getTracks().forEach((t) => t.stop());
+    recorder = null;
+    delete ui!.mic.dataset.recording;
+    ui!.mic.title = "Dictate";
+    ui!.micTime.textContent = "…";
+    ui!.mic.disabled = true;
+    try {
+      const text = await invoke<string>("transcribe", { dataUrl: await dataUrl(new Blob(chunks, { type: rec.mimeType })) });
+      const box = ui!.input;
+      if (text) box.setRangeText(text, box.selectionStart, box.selectionEnd, "end");
+      box.focus();
+    } catch (e) {
+      ui!.composerError.textContent = `Dictation failed: ${asError(e).message}`;
+    } finally {
+      ui!.micTime.textContent = "";
+      ui!.mic.disabled = false;
+    }
+  };
+  rec.start();
 }
 
 function updateComposer() {
