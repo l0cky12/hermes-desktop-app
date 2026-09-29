@@ -5,12 +5,12 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc='Thin desktop client for a self-hosted Hermes Agent gateway'
 arch=('x86_64')
-license=('unknown')
-depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'glib2' 'cairo' 'gdk-pixbuf2' 'dbus' 'gcc-libs' 'glibc')
+license=('LicenseRef-unknown')
+depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'glib2' 'cairo' 'gdk-pixbuf2' 'dbus' 'libgcc' 'glibc' 'hicolor-icon-theme')
 makedepends=('git' 'rust' 'nodejs' 'npm')
 optdepends=('gnome-keyring: Secret Service keyring for saving credentials (KWallet or KeePassXC also work)')
 options=('!lto') # makepkg's LTO flags break the C code built by Rust crates (aws-lc-sys)
-source=("$pkgname::git+file://${startdir%/packaging/arch}")
+source=("$pkgname::git+file://$(git rev-parse --show-toplevel)")
 sha256sums=('SKIP')
 
 pkgver() {
