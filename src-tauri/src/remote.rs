@@ -94,9 +94,25 @@ pub fn quote(arg: &str) -> String {
 /// `hermes <words> <args>`, every arg quoted. User-supplied positionals go after `--`, and
 /// option values are joined as `--flag=value`, so nothing typed can be read as an option.
 fn hermes(summary: &'static str, args: &[String]) -> Cmd {
+    hermes_as(None, summary, args)
+}
+
+/// Like `hermes`, run as `profile` (`hermes -p <profile> …`) when one is given.
+fn hermes_as(profile: Option<&str>, summary: &'static str, args: &[String]) -> Cmd {
     let words = summary.strip_prefix("hermes ").expect("summary names a hermes subcommand");
+    let profile = profile.map(|p| format!("-p {} ", quote(p))).unwrap_or_default();
     let args: Vec<String> = args.iter().map(|a| quote(a)).collect();
-    Cmd { summary, script: format!("exec hermes {words} {}", args.join(" ")), stdin: None }
+    Cmd { summary, script: format!("exec hermes {profile}{words} {}", args.join(" ")), stdin: None }
+}
+
+/// Sessions belong to a Profile, so these run as the one the chat runs as.
+pub fn sessions_pin(profile: Option<&str>, id: &str, pinned: bool) -> Cmd {
+    let summary = if pinned { "hermes sessions pin" } else { "hermes sessions unpin" };
+    hermes_as(profile, summary, &["--".into(), id.into()])
+}
+
+pub fn sessions_pinned(profile: Option<&str>) -> Cmd {
+    hermes_as(profile, "hermes sessions pinned", &["--json".into()])
 }
 
 pub fn kanban_list() -> Cmd {
@@ -212,6 +228,13 @@ mod tests {
         let cmd = kanban_comment("-t_1", "$(rm -rf ~) it's");
         assert_eq!(argv_seen_by_hermes(&cmd), ["kanban", "comment", "--", "-t_1", "$(rm -rf ~) it's"]);
         assert_eq!(cmd.summary, "hermes kanban comment");
+    }
+
+    #[test]
+    fn pinning_runs_as_the_profile_with_the_session_id_after_the_marker() {
+        assert_eq!(argv_seen_by_hermes(&sessions_pin(Some("coder"), "-s_1", true)), ["-p", "coder", "sessions", "pin", "--", "-s_1"]);
+        assert_eq!(argv_seen_by_hermes(&sessions_pin(None, "it's", false)), ["sessions", "unpin", "--", "it's"]);
+        assert_eq!(argv_seen_by_hermes(&sessions_pinned(Some("coder"))), ["-p", "coder", "sessions", "pinned", "--json"]);
     }
 
     #[test]

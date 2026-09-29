@@ -46,7 +46,7 @@ On first launch, enter the Dashboard URL (usually `http://<host>:9119`) and the 
 
 Under **Or run Hermes over SSH**, enter a host (`host`, `user@host`, or an `~/.ssh/config` alias). The app runs `ssh <host> hermes acp` and speaks the Agent Client Protocol over that connection, so there's no Dashboard, sign-in, or API key; your SSH keys or ssh-agent do the authentication. SSH runs in batch mode, so password and host-key prompts can't be answered: connect once from a terminal first to accept the host key. `hermes` must be on the remote `PATH` (`~/.local/bin` is added automatically).
 
-Over SSH, the app can answer Approval requests. Sessions can't be deleted, and a dropped connection can't be reattached, so Retry starts a new Run in the same Session.
+Over SSH, the app can answer Approval requests. Pins are read with `hermes sessions pinned --json` and set with `hermes sessions pin|unpin`, each its own SSH command run as the active Profile. Sessions can't be deleted, and a dropped connection can't be reattached, so Retry starts a new Run in the same Session.
 
 Kanban and Skills also work over SSH: each action runs its own `ssh <host> hermes kanban …` or `hermes config …` command (see [ADR 0002](docs/adr/0002-ssh-kanban-and-skills-via-hermes-cli.md)), and the open Board refreshes every 30 s. Every command pays for a new SSH connection, so turning on connection sharing for the host in `~/.ssh/config` makes them much faster:
 
@@ -56,6 +56,10 @@ Host hermes-box
   ControlPath ~/.ssh/cm-%r@%h:%p
   ControlPersist 10m
 ```
+
+## Sessions
+
+The Sessions panel lists the active Profile's Sessions, newest first. The pin button (shown on hover or keyboard focus) Pins a Session: Pinned Sessions stay above the rest, and the pin is Hermes's own flag (`PATCH /api/sessions/{id}`, or `hermes sessions pin` over SSH), so it survives restarts and shows on every client of that Profile. If Hermes refuses, the Session goes back where it was and the panel says why.
 
 ## Profiles, models, and reasoning
 

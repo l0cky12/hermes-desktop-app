@@ -13,7 +13,7 @@ type Status = { auth_required: boolean; auth_providers: string[] };
 type RunStarted = { run_id: string; session_id: string };
 type RunEvent = { event: string; seq?: number; [field: string]: unknown };
 type StreamMsg = { type: "event"; data: RunEvent } | { type: "dropped"; message: string };
-type Session = { id: string; title?: string | null; preview?: string | null };
+type Session = { id: string; title?: string | null; preview?: string | null; pinned?: boolean };
 type Message = { role: string; content: unknown; tool_calls?: { function?: { name?: string } }[] | null };
 type Attachment = { path: string } | { name: string; data_url: string };
 type Models = { default: ModelChoice | null; groups: { provider: string; name: string; models: string[] }[] };
@@ -322,6 +322,7 @@ const connectionId = (dash: string, api: string) => `${new URL(dash).origin}|${n
 let signInRequired = true; // the Dashboard asks for Sign-in; without it, a 401 can't be fixed by signing in
 let overSsh = false; // Hermes over SSH (hermes acp): Approvals can be answered, Sessions can't be deleted
 let sessionId: string | null = null;
+let sessions: Session[] = [];
 let active: Turn | null = null;
 let pending: Attachment[] = [];
 let models: Models = { default: null, groups: [] };
@@ -846,7 +847,6 @@ async function removeSession(id: string) {
 }
 
 async function refreshSessions() {
-  let sessions: Session[];
   try {
     sessions = await invoke<Session[]>("list_sessions");
   } catch (e) {
@@ -856,8 +856,29 @@ async function refreshSessions() {
     return;
   }
   ui!.sessionsError.textContent = "";
+  renderSessions();
+}
+
+/** Shown at once, put back if Hermes refuses. */
+async function togglePin(s: Session) {
+  const pinned = !s.pinned;
+  s.pinned = pinned;
+  renderSessions();
+  try {
+    await invoke("pin_session", { id: s.id, pinned });
+    ui!.sessionsError.textContent = "";
+  } catch (e) {
+    s.pinned = !pinned;
+    renderSessions();
+    ui!.sessionsError.textContent = `Couldn't ${pinned ? "pin" : "unpin"} the session: ${asError(e).message}`;
+  }
+}
+
+function renderSessions() {
+  // Pinned Sessions first; sort is stable, so each group keeps the gateway's newest-first order.
+  const ordered = [...sessions].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned));
   ui!.sessions.replaceChildren(
-    ...sessions.map((s) => {
+    ...ordered.map((s) => {
       const del = h("button", { className: "link", textContent: "Delete" });
       del.onclick = (e) => {
         e.stopPropagation();
@@ -869,8 +890,16 @@ async function refreshSessions() {
           del.textContent = "Delete";
         }, 3000);
       };
-      const li = h("li", { onclick: () => openSession(s.id) }, h("span", { textContent: s.title || s.preview || s.id }), ...(overSsh ? [] : [del]));
+      const pin = h("button", { className: "pin", title: s.pinned ? "Unpin" : "Pin to the top" }, icon("pin", 14));
+      pin.setAttribute("aria-label", "Pin");
+      pin.setAttribute("aria-pressed", String(!!s.pinned));
+      pin.onclick = (e) => {
+        e.stopPropagation();
+        void togglePin(s);
+      };
+      const li = h("li", { onclick: () => openSession(s.id) }, h("span", { textContent: s.title || s.preview || s.id }), pin, ...(overSsh ? [] : [del]));
       li.dataset.id = s.id;
+      li.classList.toggle("pinned", !!s.pinned);
       return li;
     }),
   );

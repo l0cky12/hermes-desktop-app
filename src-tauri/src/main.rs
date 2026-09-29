@@ -508,10 +508,17 @@ async fn answer_permission(
 
 #[tauri::command]
 async fn list_sessions(state: State<'_, AppState>) -> Result<Value, Error> {
-    if state.ssh() {
+    if let Some(host) = state.ssh_host() {
         let hermes = state.hermes().await?;
+        let profile = state.lock().profile.clone();
+        // ACP's session/list has no pinned flag; the CLI knows. Without it, nothing shows as pinned.
         // ponytail: first page only, like the API server's newest 100; follow nextCursor when it matters.
-        let mut page = hermes.request("session/list", json!({})).await?;
+        let (page, pins) = tokio::join!(
+            hermes.request("session/list", json!({})),
+            remote::run(&host, remote::sessions_pinned(profile.as_deref())),
+        );
+        let mut page = page?;
+        let pinned = pinned_ids(pins.and_then(|out| remote::json(&out)).unwrap_or_default());
         let mut cwds = hermes.cwds.lock().unwrap();
         let sessions = page["sessions"].as_array_mut().map(std::mem::take).unwrap_or_default();
         return Ok(sessions
@@ -521,7 +528,7 @@ async fn list_sessions(state: State<'_, AppState>) -> Result<Value, Error> {
                 if let Some(cwd) = s["cwd"].as_str() {
                     cwds.insert(id.clone(), cwd.to_owned());
                 }
-                json!({ "id": id, "title": s["title"] })
+                json!({ "id": id, "title": s["title"], "pinned": pinned.contains(&id) })
             })
             .collect());
     }
@@ -545,6 +552,22 @@ async fn session_messages(state: State<'_, AppState>, id: String) -> Result<Valu
     }
     let request = state.api(Method::GET, &["api", "sessions", &id, "messages"], &[])?;
     Ok(json_body(send(&state.client, request).await?).await?["data"].take())
+}
+
+/// The ids in `hermes sessions pinned --json`.
+fn pinned_ids(list: Value) -> HashSet<String> {
+    list.as_array().into_iter().flatten().filter_map(|s| s["id"].as_str().map(str::to_owned)).collect()
+}
+
+/// Sets Hermes's own pinned flag, so the pin shows on every client of this Profile.
+#[tauri::command]
+async fn pin_session(state: State<'_, AppState>, id: String, pinned: bool) -> Result<(), Error> {
+    if let Some(host) = state.ssh_host() {
+        let profile = state.lock().profile.clone();
+        return remote::run(&host, remote::sessions_pin(profile.as_deref(), &id, pinned)).await.map(drop);
+    }
+    let request = state.api(Method::PATCH, &["api", "sessions", &id], &[])?.json(&json!({ "pinned": pinned }));
+    send(&state.client, request).await.map(drop)
 }
 
 #[tauri::command]
@@ -935,6 +958,7 @@ fn main() {
             answer_permission,
             list_sessions,
             session_messages,
+            pin_session,
             delete_session,
             start_run,
             stream_run,
@@ -971,6 +995,13 @@ mod tests {
         inner.profile = Some("coder".into());
         assert_eq!(inner.replace_key(None), Some("c".into()), "rollback of a rejected key");
         assert_eq!(inner.creds.api_key.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn pinned_ids_come_from_the_cli_listing() {
+        let listed = json!([{ "id": "a", "title": "x" }, { "id": "b" }, { "title": "no id" }]);
+        assert_eq!(pinned_ids(listed), HashSet::from(["a".to_owned(), "b".to_owned()]));
+        assert!(pinned_ids(Value::Null).is_empty(), "an unreadable answer pins nothing");
     }
 
     #[test]
