@@ -111,11 +111,7 @@ impl AppState {
     fn dashboard(&self, method: Method, path: &[&str], query: &[(&str, &str)]) -> Result<RequestBuilder, Error> {
         let inner = self.lock();
         let gateway = inner.gateway.as_ref().ok_or_else(not_configured)?;
-        let mut url = endpoint(&gateway.dashboard, path);
-        if !query.is_empty() {
-            url.query_pairs_mut().extend_pairs(query);
-        }
-        let request = self.client.request(method, url);
+        let request = self.client.request(method, endpoint(&gateway.dashboard, path, query));
         Ok(match inner.creds.cookies.is_empty() {
             true => request,
             false => request.header(header::COOKIE, cookie_header(&inner.creds.cookies)),
@@ -127,10 +123,7 @@ impl AppState {
         let inner = self.lock();
         let gateway = inner.gateway.as_ref().ok_or_else(not_configured)?;
         let key = inner.api_key().ok_or_else(|| Error::Unauthorized("No API key saved for this profile".into()))?;
-        let mut url = endpoint(&gateway.api, &picker::api_segments(inner.profile.as_deref(), path));
-        if !query.is_empty() {
-            url.query_pairs_mut().extend_pairs(query);
-        }
+        let url = endpoint(&gateway.api, &picker::api_segments(inner.profile.as_deref(), path), query);
         Ok(self.client.request(method, url).bearer_auth(key))
     }
 
