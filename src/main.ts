@@ -2,7 +2,10 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { field, h, icon, input } from "./dom";
 import { appearanceTab, applyAppearance } from "./appearance";
-import { saveProfile, startProfile } from "./prefs";
+import {
+  changeLabel, choiceKey, DEFAULT_CHOICE, loadChoice, REASONING_LEVELS, saveChoice, saveProfile, startProfile,
+  type Choice, type ModelChoice,
+} from "./prefs";
 
 type GatewayError = { kind: "unreachable" | "unauthorized" | "not_found" | "http" | "invalid"; message: string };
 type Init = { dashboard_url: string | null; api_url: string | null; ssh_host: string | null; keyring: boolean };
@@ -13,6 +16,7 @@ type StreamMsg = { type: "event"; data: RunEvent } | { type: "dropped"; message:
 type Session = { id: string; title?: string | null; preview?: string | null };
 type Message = { role: string; content: unknown; tool_calls?: { function?: { name?: string } }[] | null };
 type Attachment = { path: string } | { name: string; data_url: string };
+type Models = { default: ModelChoice | null; groups: { provider: string; name: string; models: string[] }[] };
 type TurnStatus = "streaming" | "done" | "stopped" | "failed" | "not-sent";
 
 interface Turn {
@@ -27,6 +31,7 @@ interface Turn {
   replyEl: HTMLElement;
   notice: HTMLElement;
   statusEl: HTMLElement;
+  choice: Choice;
 }
 
 applyAppearance();
@@ -316,6 +321,9 @@ let overSsh = false; // Hermes over SSH (hermes acp): Approvals can be answered,
 let sessionId: string | null = null;
 let active: Turn | null = null;
 let pending: Attachment[] = [];
+let models: Models = { default: null, groups: [] };
+let choice: Choice = DEFAULT_CHOICE; // what the next Turn in this view runs on
+let lastChoice: Choice | undefined; // what the previous Turn ran on, for the reply label
 let ui: {
   sessions: HTMLUListElement;
   sessionsError: HTMLElement;
@@ -328,6 +336,10 @@ let ui: {
   toolbar: HTMLElement;
   spacer: HTMLElement;
   profile: HTMLSelectElement;
+  modelPicker: HTMLElement;
+  modelLabel: HTMLElement;
+  menu: HTMLElement;
+  reasoning: HTMLSelectElement;
 } | null = null;
 
 function showChat(supported: boolean, ssh = false) {
@@ -346,6 +358,11 @@ function showChat(supported: boolean, ssh = false) {
     toolbar: h("div", { className: "toolbar" }),
     spacer: h("span", { className: "spacer" }),
     profile: h("select", { title: "Profile" }),
+    modelPicker: h("span", { className: "picker model" }),
+    modelLabel: h("span"),
+    menu: h("div", { className: "menu" }),
+    reasoning: h("select", {}, h("option", { value: "", textContent: "Default" }),
+      ...REASONING_LEVELS.map((r) => h("option", { value: r, textContent: r }))),
   };
   const { input: box, send: button } = ui;
   const picker = h("input", { type: "file", multiple: true, hidden: true });
@@ -359,6 +376,15 @@ function showChat(supported: boolean, ssh = false) {
   box.onpaste = (e) => void pasteImages(e);
   ui.profile.onchange = () => void useProfile(ui!.profile.value, profile);
   ui.toolbar.insertBefore(h("span", { className: "picker profile", title: "Profile" }, icon("user"), ui.profile), ui.spacer);
+  ui.modelPicker.append(h("button", { type: "button", className: "icon-btn", title: "Model", onclick: toggleModelMenu }, icon("cpu"), ui.modelLabel, icon("chevron", 12)));
+  const reasoningPicker = h("span", { className: "picker", title: "Reasoning level" }, icon("brain"), ui.reasoning);
+  if (overSsh) {
+    ui.reasoning.disabled = true;
+    reasoningPicker.title = "Over SSH, the reasoning level is set in the profile's config";
+  }
+  ui.reasoning.onchange = () => setChoice({ ...choice, reasoning: ui!.reasoning.value || null });
+  ui.toolbar.insertBefore(ui.modelPicker, ui.spacer);
+  ui.toolbar.insertBefore(reasoningPicker, ui.spacer);
   box.onkeydown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -525,6 +551,7 @@ function addTurn(text: string, files: Attachment[]): Turn {
     replyEl: h("div", { className: "reply" }),
     notice: h("p", { className: "notice" }),
     statusEl: h("div", { className: "status" }),
+    choice: DEFAULT_CHOICE,
   };
   turn.root.append(...(text || files.length ? [user] : []), turn.tools, turn.replyEl, turn.notice, turn.statusEl);
   ui!.turns.append(turn.root);
@@ -569,6 +596,10 @@ async function send() {
   const text = ui!.input.value.trim();
   if (!text && !pending.length) return;
   const turn = addTurn(text, pending);
+  turn.choice = choice;
+  const label = changeLabel(lastChoice, choice);
+  lastChoice = choice;
+  if (label) turn.replyEl.after(h("div", { className: "model-label", textContent: label }));
   pending = [];
   ui!.composerError.textContent = "";
   renderPending();
@@ -587,7 +618,9 @@ async function beginRun(turn: Turn) {
   setStatus(turn, "streaming");
   let run: RunStarted;
   try {
-    run = await invoke<RunStarted>("start_run", { sessionId, text: turn.text, files: turn.files });
+    run = await invoke<RunStarted>("start_run", {
+      sessionId, text: turn.text, files: turn.files, model: turn.choice.model, reasoning: turn.choice.reasoning,
+    });
   } catch (e) {
     const x = asError(e);
     setStatus(turn, "not-sent", `Not sent: ${x.message}`);
@@ -600,6 +633,7 @@ async function beginRun(turn: Turn) {
   }
   turn.runId = run.run_id;
   sessionId = run.session_id;
+  saveChoice(localStorage, choiceKey(connection, profile, run.session_id), choice);
   updateComposer();
   try {
     await openStream(turn);
@@ -705,6 +739,9 @@ function markCurrent() {
 function newChat() {
   leave();
   sessionId = null;
+  choice = DEFAULT_CHOICE;
+  lastChoice = undefined;
+  renderChoice();
   ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "New chat. Type a message, or drop files to attach them." }));
   markCurrent();
 }
@@ -712,6 +749,9 @@ function newChat() {
 async function openSession(id: string) {
   leave();
   sessionId = id;
+  choice = loadChoice(localStorage, choiceKey(connection, profile, id));
+  lastChoice = choice;
+  renderChoice();
   markCurrent();
   ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "Loading…" }));
   try {
@@ -825,6 +865,63 @@ async function profileKey(name: string, previous: string | null): Promise<boolea
   }
 }
 
-async function refreshModels() {} // filled in by the model picker
+async function refreshModels() {
+  try {
+    models = await invoke<Models>("list_models");
+    ui!.modelPicker.title = "Model";
+  } catch (e) {
+    models = { default: null, groups: [] };
+    ui!.modelPicker.title = `Couldn't list models: ${asError(e).message}. Runs use the profile's default.`;
+  }
+  renderChoice();
+}
+
+const modelLabel = (m: ModelChoice | null) => m?.model ?? `Profile default${models.default ? ` (${models.default.model})` : ""}`;
+
+function renderChoice() {
+  ui!.modelLabel.textContent = modelLabel(choice.model);
+  ui!.reasoning.value = choice.reasoning ?? "";
+}
+
+/** Takes effect from the next Turn, and is saved per Session once the Session exists. */
+function setChoice(next: Choice) {
+  choice = next;
+  if (sessionId) saveChoice(localStorage, choiceKey(connection, profile, sessionId), choice);
+  renderChoice();
+}
+
+/** The CPU picker: set-up providers only, grouped, filtered by the search box. */
+function toggleModelMenu() {
+  const { menu, modelPicker } = ui!;
+  if (menu.isConnected) return menu.remove();
+  const search = h("input", { type: "search", placeholder: "Search models", required: false });
+  const list = h("div");
+  const item = (label: string, m: ModelChoice | null) => {
+    const b = h("button", { type: "button", textContent: label, onclick: () => (setChoice({ ...choice, model: m }), menu.remove()) });
+    b.ariaSelected = String(JSON.stringify(m) === JSON.stringify(choice.model));
+    return b;
+  };
+  const render = () => {
+    const q = search.value.trim().toLowerCase();
+    const groups = models.groups
+      .map((g) => ({ ...g, models: g.models.filter((m) => `${g.name} ${m}`.toLowerCase().includes(q)) }))
+      .filter((g) => g.models.length);
+    list.replaceChildren(
+      ...(q ? [] : [item(modelLabel(null), null)]),
+      ...groups.flatMap((g) => [h("h3", { textContent: g.name }), ...g.models.map((m) => item(m, { provider: g.provider, model: m }))]),
+      ...(groups.length ? [] : [h("p", { textContent: q ? "No matching models" : modelPicker.title })]),
+    );
+  };
+  search.oninput = render;
+  search.onkeydown = (e) => void (e.key === "Escape" && menu.remove());
+  render();
+  menu.replaceChildren(search, list);
+  modelPicker.append(menu);
+  search.focus();
+}
+
+document.addEventListener("pointerdown", (e) => {
+  if (ui && !ui.modelPicker.contains(e.target as Node)) ui.menu.remove();
+});
 
 boot();
