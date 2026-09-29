@@ -110,6 +110,16 @@ pub fn acp_id(c: &ModelChoice) -> String {
     format!("{}:{}", c.provider, c.model)
 }
 
+/// Over SSH the model is Session state. Returns the id to `session/set_model` before a Turn: only
+/// when the Session is on another model than the one chosen (`None` = the Profile's default).
+pub fn model_switch(chosen: Option<&ModelChoice>, current: Option<&str>, default: Option<&str>) -> Option<String> {
+    let wanted = match chosen {
+        Some(m) => acp_id(m),
+        None => default?.to_owned(),
+    };
+    (current != Some(wanted.as_str())).then_some(wanted)
+}
+
 /// The `models` field of an ACP `session/new` answer: `{ availableModels, currentModelId }`.
 pub fn from_acp(state: &Value) -> Models {
     let mut groups: Vec<ModelGroup> = Vec::new();
@@ -228,6 +238,17 @@ mod tests {
             json!({ "input": "hi", "session_id": "s1", "provider": "zai", "model": "glm-5.3-flash",
                     "model_options": { "reasoning_effort": "high" } })
         );
+    }
+
+    #[test]
+    fn ssh_model_is_switched_only_when_the_session_is_on_another() {
+        let glm = ModelChoice { provider: "zai".into(), model: "glm".into() };
+        assert_eq!(model_switch(Some(&glm), Some("zai:glm"), Some("x:d")), None);
+        assert_eq!(model_switch(Some(&glm), Some("x:d"), Some("x:d")).as_deref(), Some("zai:glm"));
+        // Profile default: a Session left on another model (by this app or any other client) goes back.
+        assert_eq!(model_switch(None, Some("zai:glm"), Some("x:d")).as_deref(), Some("x:d"));
+        assert_eq!(model_switch(None, Some("x:d"), Some("x:d")), None);
+        assert_eq!(model_switch(None, Some("zai:glm"), None), None, "default unknown: leave it");
     }
 
     #[test]

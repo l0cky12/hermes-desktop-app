@@ -3,7 +3,7 @@
 //! is a secret, and the remote Hermes owns all Session state.
 
 use crate::gateway::Error;
-use crate::picker::{acp_id, parse_profile_list, ModelChoice, Profiles};
+use crate::picker::{model_switch, parse_profile_list, ModelChoice, Profiles};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -61,8 +61,8 @@ pub struct Conn {
     pub cwds: Mutex<HashMap<String, String>>,
     /// `models` from the last `session/new` answer: the list and the Profile's default.
     models: Mutex<Option<Value>>,
-    /// The model id this app last set on each Session.
-    applied: Mutex<HashMap<String, String>>,
+    /// The model id each Session is on, as last reported by `session/new`/`session/load` or set here.
+    current: Mutex<HashMap<String, String>>,
     _child: Child,
 }
 
@@ -102,7 +102,7 @@ pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Err
         home,
         cwds: Mutex::default(),
         models: Mutex::default(),
-        applied: Mutex::default(),
+        current: Mutex::default(),
         _child: child,
     });
     tokio::spawn(read(conn.clone(), lines, stderr));
@@ -243,22 +243,20 @@ impl Conn {
         self.models.lock().unwrap().clone()
     }
 
-    /// Over SSH the model is Session state: it's switched between Turns, and only when it changes.
-    pub async fn use_model(&self, session: &str, model: Option<&ModelChoice>) -> Result<(), Error> {
-        let applied = self.applied.lock().unwrap().get(session).cloned();
-        let wanted = match model {
-            Some(m) => acp_id(m),
-            // Back to Profile default is needed only if this app moved the Session off it.
-            None => match (&applied, self.models().and_then(|m| m["currentModelId"].as_str().map(str::to_owned))) {
-                (Some(_), Some(default)) => default,
-                _ => return Ok(()),
-            },
-        };
-        if applied.as_deref() == Some(wanted.as_str()) {
-            return Ok(());
+    /// Records the model a `session/new` or `session/load` answer says the Session is on.
+    pub fn note_model(&self, session: &str, answer: &Value) {
+        if let Some(id) = answer["models"]["currentModelId"].as_str() {
+            self.current.lock().unwrap().insert(session.to_owned(), id.to_owned());
         }
+    }
+
+    /// Switches the Session's model between Turns, only when it's on another one than chosen.
+    pub async fn use_model(&self, session: &str, model: Option<&ModelChoice>) -> Result<(), Error> {
+        let current = self.current.lock().unwrap().get(session).cloned();
+        let default = self.models().and_then(|m| m["currentModelId"].as_str().map(str::to_owned));
+        let Some(wanted) = model_switch(model, current.as_deref(), default.as_deref()) else { return Ok(()) };
         self.request("session/set_model", json!({ "sessionId": session, "modelId": wanted })).await?;
-        self.applied.lock().unwrap().insert(session.to_owned(), wanted);
+        self.current.lock().unwrap().insert(session.to_owned(), wanted);
         Ok(())
     }
 

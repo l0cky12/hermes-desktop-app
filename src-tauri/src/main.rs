@@ -427,7 +427,11 @@ async fn connect_ssh(state: State<'_, AppState>) -> Result<(), Error> {
 async fn list_profiles(state: State<'_, AppState>) -> Result<picker::Profiles, Error> {
     if state.ssh() {
         let host = state.lock().ssh_host.clone().ok_or_else(not_configured)?;
-        return acp::list_profiles(&host).await;
+        let profiles = acp::list_profiles(&host).await?;
+        // Plain `hermes acp` (no Profile picked yet) runs the Gateway's default, so picking that
+        // one next doesn't restart Hermes.
+        state.lock().profile.get_or_insert_with(|| profiles.active.clone().unwrap_or_else(|| "default".into()));
+        return Ok(profiles);
     }
     let get = |path: &'static [&'static str]| state.dashboard(Method::GET, path, &[]);
     let list = json_body(send(&state.client, get(&["api", "profiles"])?).await?).await?;
@@ -523,6 +527,7 @@ async fn session_messages(state: State<'_, AppState>, id: String) -> Result<Valu
         if loaded.is_null() {
             return Err(Error::NotFound("Hermes has no such session".into()));
         }
+        hermes.note_model(&id, &loaded);
         return Ok(json!(acp::history(&replay)));
     }
     let request = state.api(Method::GET, &["api", "sessions", &id, "messages"], &[])?;
@@ -572,7 +577,9 @@ async fn start_run(
             Some(id) => id,
             None => {
                 let created = hermes.request("session/new", json!({ "cwd": hermes.home, "mcpServers": [] })).await?;
-                created["sessionId"].as_str().ok_or_else(|| Error::Http("Session created without an id".into()))?.to_owned()
+                let id = created["sessionId"].as_str().ok_or_else(|| Error::Http("Session created without an id".into()))?;
+                hermes.note_model(id, &created);
+                id.to_owned()
             }
         };
         hermes.use_model(&session, model.as_ref()).await?;
