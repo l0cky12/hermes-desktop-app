@@ -61,7 +61,7 @@ pub fn build_input(text: &str, files: &[Source]) -> Result<Value, String> {
             }
             message.push_str(&format!("Attached file `{name}`:\n{fence}\n{content}\n{fence}"));
         } else {
-            return Err(format!("{name}: only text and image files can be attached"));
+            return Err(format!("{name}: only text and images can be attached"));
         }
     }
     if images.is_empty() {
@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn binary_and_oversized_files_are_refused() {
-        assert!(build_input("", &[temp("blob.bin", &[0, 159, 146, 150])]).unwrap_err().contains("only text and image"));
+        assert!(build_input("", &[temp("blob.bin", &[0, 159, 146, 150])]).unwrap_err().ends_with("only text and images can be attached"));
         let big = temp("big.txt", &vec![b'a'; MAX_BYTES as usize + 1]);
         assert!(build_input("", &[big]).unwrap_err().contains("larger than 2 MB"));
     }

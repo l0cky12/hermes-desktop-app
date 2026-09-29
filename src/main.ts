@@ -354,15 +354,15 @@ function showChat(supported: boolean, ssh = false) {
     sessionsError: h("p", { className: "error" }),
     turns: h("div", { className: "turns" }),
     pending: h("div", { className: "pending" }),
-    input: h("textarea", { placeholder: runs ? "Message Hermes. Drop, paste, or attach files." : unavailable, rows: 3 }),
+    input: h("textarea", { placeholder: runs ? "Message Hermes. Drop, paste, or pick attachments." : unavailable, rows: 3 }),
     send: h("button", { textContent: "Send" }),
-    drop: h("div", { className: "drop", hidden: true, textContent: runs ? "Drop files to attach" : unavailable }),
+    drop: h("div", { className: "drop", hidden: true, textContent: runs ? "Drop to attach" : unavailable }),
     composerError: h("p", { className: "error" }),
     toolbar: h("div", { className: "toolbar" }),
     spacer: h("span", { className: "spacer" }),
     mic: h("button", { type: "button", className: "icon-btn", title: "Dictate" }),
     micTime: h("span"),
-    paperclip: h("button", { type: "button", className: "icon-btn", title: "Attach files" }, icon("paperclip")),
+    paperclip: h("button", { type: "button", className: "icon-btn", title: "Add attachments" }, icon("paperclip")),
     profile: h("select", { title: "Profile" }),
     modelPicker: h("span", { className: "picker model" }),
     modelLabel: h("span"),
@@ -801,7 +801,7 @@ function newChat() {
   choice = DEFAULT_CHOICE;
   lastChoice = DEFAULT_CHOICE; // a choice made before the first message is a change too
   renderChoice();
-  ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "New chat. Type a message, or drop files to attach them." }));
+  ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "New chat. Type a message, or drop attachments here." }));
   markCurrent();
 }
 
