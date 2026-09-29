@@ -1,8 +1,11 @@
 mod acp;
 mod attach;
 mod gateway;
+mod log;
 mod picker;
+mod remote;
 mod sse;
+mod work;
 
 use gateway::{absorb_cookies, cookie_header, describe, endpoint, parse_origin, send, Error};
 use reqwest::{header, Method, RequestBuilder, Response, Url};
@@ -95,6 +98,8 @@ struct AppState {
     hermes: tokio::sync::Mutex<Option<Arc<acp::Conn>>>,
     /// SSH-mode Runs by run id: their Session, and the prompt until `stream_run` sends it.
     acp_runs: Mutex<HashMap<String, AcpRun>>,
+    /// Over SSH: each listed Skill's SKILL.md path, so reading one never takes a path from the webview.
+    skill_paths: Mutex<HashMap<String, String>>,
 }
 
 struct AcpRun {
@@ -145,6 +150,21 @@ impl AppState {
 
     fn ssh(&self) -> bool {
         self.lock().ssh_host.is_some()
+    }
+
+    fn ssh_host(&self) -> Option<String> {
+        self.lock().ssh_host.clone()
+    }
+
+    /// A Dashboard request's JSON answer, keeping any cookies it rotated.
+    async fn dashboard_json(&self, request: RequestBuilder) -> Result<Value, Error> {
+        let response = send(&self.client, request).await?;
+        self.absorb(&response).await;
+        json_body(response).await
+    }
+
+    fn kanban(&self, method: Method, path: &[&str], query: &[(&str, &str)]) -> Result<RequestBuilder, Error> {
+        self.dashboard(method, &[&["api", "plugins", "kanban"], path].concat(), query)
     }
 
     /// The SSH connection to Hermes, (re)started on demand.
@@ -206,7 +226,7 @@ fn load_creds() -> (Option<Creds>, bool) {
         Ok(json) => (serde_json::from_str(&json).ok(), true),
         Err(keyring::Error::NoEntry) => (None, true),
         Err(e) => {
-            eprintln!("[keyring] unavailable, credentials will not be saved: {e}");
+            log::write("keyring", format!("unavailable, credentials will not be saved: {e}"));
             (None, false)
         }
     }
@@ -225,20 +245,20 @@ fn save_creds(creds: Creds) -> bool {
         }
     });
     if let Err(e) = &result {
-        eprintln!("[keyring] save failed, credentials kept in memory only: {e}");
+        log::write("keyring", format!("save failed, credentials kept in memory only: {e}"));
     }
     result.is_ok()
 }
 
 fn load_settings(path: &Path) -> Option<Settings> {
     serde_json::from_slice(&std::fs::read(path).ok()?)
-        .inspect_err(|e| eprintln!("[settings] ignoring unreadable {}: {e}", path.display()))
+        .inspect_err(|e| log::write("settings", format!("ignoring unreadable {}: {e}", path.display())))
         .ok()
 }
 
 fn load_ssh_host(settings: &Settings, path: &Path) -> Option<String> {
     let host = acp::valid_host(settings.ssh_host.as_deref()?)
-        .inspect_err(|_| eprintln!("[settings] ignoring invalid SSH host in {}", path.display()));
+        .inspect_err(|_| log::write("settings", format!("ignoring invalid SSH host in {}", path.display())));
     host.ok()
 }
 
@@ -246,7 +266,7 @@ fn load_gateway(settings: &Settings, path: &Path) -> Option<Gateway> {
     match (parse_origin(&settings.dashboard_url), parse_origin(&settings.api_url)) {
         (Ok(dashboard), Ok(api)) => Some(Gateway { dashboard, api }),
         _ => {
-            eprintln!("[settings] ignoring invalid gateway URLs in {}", path.display());
+            log::write("settings", format!("ignoring invalid gateway URLs in {}", path.display()));
             None
         }
     }
@@ -269,7 +289,7 @@ async fn init(state: State<'_, AppState>) -> Result<Init, Error> {
     inner.creds = match (stored, &inner.gateway) {
         (Some(c), Some(g)) if c.dashboard_url == g.dashboard.as_str() && c.api_url == g.api.as_str() => c,
         (Some(_), _) => {
-            eprintln!("[keyring] stored credentials belong to a different gateway; ignoring them");
+            log::write("keyring", "stored credentials belong to a different gateway; ignoring them");
             Creds::default()
         }
         (None, _) => Creds::default(),
@@ -653,7 +673,7 @@ async fn pump(mut response: Response, channel: &Channel<StreamMsg>) {
             Err(e) => break describe(&e),
         }
     };
-    eprintln!("[gateway] run stream dropped: {message}");
+    log::write("gateway", format!("run stream dropped: {message}"));
     let _ = channel.send(StreamMsg::Dropped { message });
 }
 
@@ -732,6 +752,130 @@ async fn stop_run(state: State<'_, AppState>, run_id: String) -> Result<(), Erro
     Ok(())
 }
 
+// ---- Board and Skills: Dashboard routes, or `ssh host hermes …` (ADR 0002) ----
+
+#[tauri::command]
+async fn kanban_board(state: State<'_, AppState>) -> Result<Vec<work::Task>, Error> {
+    if let Some(host) = state.ssh_host() {
+        return Ok(work::board_from_cli(remote::json(&remote::run(&host, remote::kanban_list()).await?)?));
+    }
+    let request = state.kanban(Method::GET, &["board"], &[("include_archived", "true")])?;
+    match state.dashboard_json(request).await {
+        Err(Error::NotFound(_)) => Err(Error::NotFound("The Kanban plugin is disabled on this Hermes".into())),
+        body => Ok(work::board_from_dashboard(body?)),
+    }
+}
+
+#[tauri::command]
+async fn kanban_assignees(state: State<'_, AppState>) -> Result<Vec<String>, Error> {
+    let body = match state.ssh_host() {
+        Some(host) => remote::json(&remote::run(&host, remote::kanban_assignees()).await?)?,
+        None => state.dashboard_json(state.kanban(Method::GET, &["assignees"], &[])?).await?,
+    };
+    Ok(work::assignee_names(body))
+}
+
+#[tauri::command]
+async fn kanban_task(state: State<'_, AppState>, id: String) -> Result<work::Detail, Error> {
+    let body = match state.ssh_host() {
+        Some(host) => remote::json(&remote::run(&host, remote::kanban_show(&id)).await?)?,
+        None => state.dashboard_json(state.kanban(Method::GET, &["tasks", &id], &[])?).await?,
+    };
+    work::detail_from(body).map_err(|e| Error::Http(format!("Unreadable task: {e}")))
+}
+
+#[tauri::command]
+async fn kanban_create(state: State<'_, AppState>, task: work::NewTask) -> Result<(), Error> {
+    if task.title.trim().is_empty() {
+        return Err(Error::Invalid("A task needs a title".into()));
+    }
+    match state.ssh_host() {
+        Some(host) => remote::run(&host, remote::kanban_create(&task)).await.map(drop),
+        None => state.dashboard_json(state.kanban(Method::POST, &["tasks"], &[])?.json(&task)).await.map(drop),
+    }
+}
+
+#[tauri::command]
+async fn kanban_comment(state: State<'_, AppState>, id: String, text: String) -> Result<(), Error> {
+    if text.trim().is_empty() {
+        return Err(Error::Invalid("A comment can't be empty".into()));
+    }
+    match state.ssh_host() {
+        Some(host) => remote::run(&host, remote::kanban_comment(&id, &text)).await.map(drop),
+        None => {
+            let request = state.kanban(Method::POST, &["tasks", &id, "comments"], &[])?.json(&json!({ "body": text }));
+            state.dashboard_json(request).await.map(drop)
+        }
+    }
+}
+
+/// One Dispatch pass (or a preview of one), capped at Hermes's default of 8 spawns.
+#[tauri::command]
+async fn kanban_dispatch(state: State<'_, AppState>, dry_run: bool) -> Result<Value, Error> {
+    if let Some(host) = state.ssh_host() {
+        return remote::json(&remote::run(&host, remote::kanban_dispatch(dry_run)).await?);
+    }
+    let query = [("dry_run", if dry_run { "true" } else { "false" }), ("max", remote::DISPATCH_MAX)];
+    state.dashboard_json(state.kanban(Method::POST, &["dispatch"], &query)?).await
+}
+
+#[tauri::command]
+async fn skills_list(state: State<'_, AppState>) -> Result<Vec<work::Skill>, Error> {
+    if let Some(host) = state.ssh_host() {
+        let (skills, paths) = work::skills_from_ssh(&remote::run(&host, remote::skills_list()).await?);
+        *state.skill_paths.lock().unwrap() = paths;
+        return Ok(skills);
+    }
+    Ok(work::skills_from_dashboard(state.dashboard_json(state.dashboard(Method::GET, &["api", "skills"], &[])?).await?))
+}
+
+/// The Skill's raw SKILL.md.
+#[tauri::command]
+async fn skill_content(state: State<'_, AppState>, name: String) -> Result<String, Error> {
+    if let Some(host) = state.ssh_host() {
+        let path = state.skill_paths.lock().unwrap().get(&name).cloned();
+        let path = path.ok_or_else(|| Error::NotFound(format!("No skill named {name}")))?;
+        return remote::run(&host, remote::skill_content(&path)).await;
+    }
+    let request = state.dashboard(Method::GET, &["api", "skills", "content"], &[("name", &name)])?;
+    Ok(state.dashboard_json(request).await?["content"].as_str().unwrap_or_default().to_owned())
+}
+
+/// Enables or disables a Skill for the active Profile on every platform.
+#[tauri::command]
+async fn skill_toggle(state: State<'_, AppState>, name: String, enabled: bool) -> Result<(), Error> {
+    if work::is_essential(&name) {
+        return Err(Error::Invalid(format!("{name} is essential and can't be disabled")));
+    }
+    let Some(host) = state.ssh_host() else {
+        let request = state.dashboard(Method::PUT, &["api", "skills", "toggle"], &[])?.json(&json!({ "name": name, "enabled": enabled }));
+        return state.dashboard_json(request).await.map(drop);
+    };
+    // ponytail: read-modify-write; a toggle from another client in between is lost. Fine for one user.
+    // An unreadable answer must stop here: writing back a guessed list would re-enable every other Skill.
+    let current = remote::json(&remote::run(&host, remote::skills_disabled()).await?)?;
+    let mut disabled: Vec<String> = match current {
+        Value::Null => Vec::new(),
+        list => serde_json::from_value(list).map_err(|e| Error::Http(format!("Unreadable skills.disabled: {e}")))?,
+    };
+    disabled.retain(|n| *n != name);
+    if !enabled {
+        disabled.push(name);
+    }
+    remote::run(&host, remote::skills_set_disabled(&disabled)).await.map(drop)
+}
+
+/// The Client log so far; new lines arrive on `on_line`.
+#[tauri::command]
+fn client_log(on_line: Channel<log::Line>) -> Vec<log::Line> {
+    log::subscribe(on_line)
+}
+
+#[tauri::command]
+fn clear_client_log() {
+    log::clear();
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -748,6 +892,7 @@ fn main() {
                 dropped: Mutex::default(),
                 hermes: tokio::sync::Mutex::default(),
                 acp_runs: Mutex::default(),
+                skill_paths: Mutex::default(),
             });
             #[cfg(target_os = "linux")]
             if let Some(window) = app.get_webview_window("main") {
@@ -794,6 +939,17 @@ fn main() {
             start_run,
             stream_run,
             stop_run,
+            kanban_board,
+            kanban_assignees,
+            kanban_task,
+            kanban_create,
+            kanban_comment,
+            kanban_dispatch,
+            skills_list,
+            skill_content,
+            skill_toggle,
+            client_log,
+            clear_client_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hermes Desktop");

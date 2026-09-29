@@ -71,11 +71,11 @@ pub async fn send(client: &Client, request: RequestBuilder) -> Result<Response, 
     let request = request.build().map_err(|e| Error::Invalid(describe(&e)))?;
     let (method, path) = (request.method().clone(), request.url().path().to_owned());
     let response = client.execute(request).await.map_err(|e| {
-        eprintln!("[gateway] {method} {path} -> {}", describe(&e));
+        crate::log::write("gateway", format!("{method} {path} -> {}", describe(&e)));
         Error::Unreachable(describe(&e))
     })?;
     let status = response.status();
-    eprintln!("[gateway] {method} {path} -> {}", status.as_u16());
+    crate::log::write("gateway", format!("{method} {path} -> {}", status.as_u16()));
     if status.is_success() {
         return Ok(response);
     }

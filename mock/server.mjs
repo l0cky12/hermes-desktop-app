@@ -135,8 +135,84 @@ serve(DASH_PORT, "dashboard", async (req, res, url) => {
     const profileName = url.searchParams.get("profile") ?? "default";
     return send(res, 200, { ok: true, transcript: `hello from the mock microphone (${profileName})`, provider: "mock" });
   }
+  if (url.pathname.startsWith("/api/plugins/kanban/") || url.pathname.startsWith("/api/skills")) {
+    return work(req, res, url);
+  }
   send(res, 404, { detail: "Not Found" });
 });
+
+// Board and Skills, shaped like plugins/kanban/dashboard/plugin_api.py and web_routers/skills.py.
+// In memory only; "MOCK_KANBAN=off" answers 404 like a disabled Kanban plugin.
+const task = (id, status, title, extra = {}) =>
+  ({ id, title, body: `Body of ${title}.`, assignee: null, status, priority: 0, tenant: null, created_at: Math.floor(now()) - 3600, ...extra });
+const board = [
+  task("t_2c64562e", "todo", "Register cerberus in orchestrator SOUL.md roster", { assignee: "daedalus", priority: 5 }),
+  task("t_91bc558f", "ready", "Dotfiles: center Wi-Fi share QR code", { assignee: "backend-developer" }),
+  task("t_922275a1", "blocked", "Build and validate cerberus specialist profile", { assignee: "hephaestus", priority: 10, tenant: "homelab" }),
+  task("t_53d2c4f2", "done", "Review Phase 2 Terraform architecture", { assignee: "code-reviewer", priority: 90 }),
+  task("t_0ld0ld00", "archived", "An archived task"),
+];
+const comments = { t_922275a1: [{ id: 1, task_id: "t_922275a1", author: "dashboard", body: "Waiting on the profile build.", created_at: Math.floor(now()) - 600 }] };
+const skills = [
+  { name: "unslop", description: "Cut AI tells from any writing.", category: null, enabled: true },
+  { name: "grill-me", description: "Interview before building medium/larger projects.", category: null, enabled: true },
+  { name: "codex", description: "Delegate coding to OpenAI Codex.", category: "autonomous-ai-agents", enabled: false },
+  { name: "hermes-agent", description: "Use, configure, and extend Hermes.", category: "autonomous-ai-agents", enabled: true },
+  { name: "ad-cs-certificate-request", description: "Request AD CS certificates.", category: "devops", enabled: true },
+];
+
+async function work(req, res, url) {
+  const path = url.pathname.replace("/api/plugins/kanban", "kanban");
+  const route = `${req.method} ${path.replace(/t_[0-9a-z]+/, ":id")}`;
+  const id = path.match(/t_[0-9a-z]+/)?.[0];
+  if (path.startsWith("kanban") && env.MOCK_KANBAN === "off") return send(res, 404, { detail: "Not Found" });
+  switch (route) {
+    case "GET kanban/board": {
+      const archived = url.searchParams.get("include_archived") === "true";
+      const names = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", ...(archived ? ["archived"] : [])];
+      return send(res, 200, { columns: names.map((name) => ({ name, tasks: board.filter((t) => t.status === name) })), tenants: [], assignees: [] });
+    }
+    case "GET kanban/assignees":
+      return send(res, 200, { assignees: ["daedalus", "forge", "hephaestus"].map((name) => ({ name, on_disk: true, counts: {} })) });
+    case "GET kanban/tasks/:id": {
+      const found = board.find((t) => t.id === id);
+      return found ? send(res, 200, { task: found, comments: comments[id] ?? [], events: [], runs: [] }) : send(res, 404, { detail: `task ${id} not found` });
+    }
+    case "POST kanban/tasks": {
+      const body = await readJson(req);
+      if (!body?.title) return send(res, 422, { detail: "title is required" });
+      const created = task(`t_${randomBytes(4).toString("hex")}`, "todo", body.title, { body: body.body ?? null, assignee: body.assignee ?? null, priority: body.priority ?? 0, tenant: body.tenant ?? null });
+      board.push(created);
+      return send(res, 200, { task: created });
+    }
+    case "POST kanban/tasks/:id/comments": {
+      const body = await readJson(req);
+      if (!body?.body?.trim()) return send(res, 400, { detail: "body is required" });
+      (comments[id] ??= []).push({ id: Date.now(), task_id: id, author: "dashboard", body: body.body, created_at: Math.floor(now()) });
+      return send(res, 200, { ok: true });
+    }
+    case "POST kanban/dispatch": {
+      const ready = board.filter((t) => t.status === "ready" && t.assignee);
+      if (url.searchParams.get("dry_run") !== "true") for (const t of ready) t.status = "running";
+      return send(res, 200, { reclaimed: 0, promoted: 0, spawned: ready.map((t) => [t.id, t.assignee, "/tmp/ws"]), skipped_unassigned: [], skipped_locked: false });
+    }
+    case "GET /api/skills":
+      return send(res, 200, skills);
+    case "GET /api/skills/content": {
+      const found = skills.find((s) => s.name === url.searchParams.get("name"));
+      return found ? send(res, 200, { name: found.name, content: `---\nname: ${found.name}\ndescription: ${found.description}\n---\n\n# ${found.name}\n\nMock SKILL.md.\n`, path: "/mock" })
+        : send(res, 404, { detail: "Skill not found." });
+    }
+    case "PUT /api/skills/toggle": {
+      const body = await readJson(req);
+      const found = skills.find((s) => s.name === body?.name);
+      if (!found) return send(res, 404, { detail: "Skill not found." });
+      found.enabled = body.name === "hermes-agent" || !!body.enabled;
+      return send(res, 200, { ok: true, name: found.name, enabled: found.enabled });
+    }
+  }
+  send(res, 404, { detail: "Not Found" });
+}
 
 // ---- API server (:8642 in production) ----
 

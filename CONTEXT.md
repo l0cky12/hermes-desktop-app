@@ -43,8 +43,8 @@ _Avoid_: login error, auth error
 ### Conversation
 
 **Profile**:
-A named Hermes configuration with its own Sessions, API key, default model, and skills; the app shows one Profile at a time and never changes the Gateway's own default Profile.
-_Avoid_: account, persona, agent
+A named Hermes agent identity on the host, with its own Sessions, API key, default model, Skills, and settings; the active Profile is the one the client works with, one at a time, and the app never changes the Gateway's own default Profile.
+_Avoid_: account, persona, agent, user
 
 **Session**:
 A conversation transcript stored on the API server under one Profile; never the Sign-in cookie.
@@ -99,3 +99,35 @@ _Avoid_: mode, color scheme
 **Skin**:
 An accent palette layered on top of either Theme.
 _Avoid_: theme, color scheme
+
+### Work
+
+**Board**:
+The Hermes Kanban board of Tasks; the client works with the default Board only.
+_Avoid_: project, kanban (as a noun)
+
+**Task**:
+A unit of work on the Board with a title, body, status, priority, and optional Assignee; unrelated to a Run or a Turn.
+_Avoid_: ticket, card, job
+
+**Assignee**:
+The Profile a Task is assigned to.
+_Avoid_: owner, worker
+
+**Comment**:
+A note appended to a Task's discussion.
+_Avoid_: message, reply
+
+**Dispatch**:
+One pass of the Hermes dispatcher that hands ready Tasks to their Assignees; a Dispatch preview shows what a pass would do without doing it.
+_Avoid_: run (reserved for Run), nudge
+
+**Skill**:
+An instruction file (SKILL.md) installed for a Profile, grouped by category, which can be enabled or disabled for that Profile.
+_Avoid_: plugin, tool, prompt
+
+### Diagnostics
+
+**Client log**:
+This client's own record of what it did while talking to Hermes (requests with method, path, and status; connection events; warnings). Never contains message content or secrets. Distinct from Hermes's server logs.
+_Avoid_: logs (unqualified), server log
