@@ -761,6 +761,8 @@ fn main() {
             Ok(())
         })
         // Dictation is the only thing that asks; everything else keeps the platform default.
+        // ponytail: the mic is allowed for any origin, fine while the webview loads only bundled
+        // pages; check the requesting origin if it ever shows remote content.
         .on_permission_request(|_, kind| match kind {
             PermissionKind::Microphone => PermissionResponse::Allow,
             _ => PermissionResponse::Default,
