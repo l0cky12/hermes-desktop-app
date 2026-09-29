@@ -6,6 +6,8 @@
 //
 // Prompt keywords script the reply: "tool" (tool events), "idle" (12 s silence, so a 10 s
 // keepalive fires mid-stream), "slow" (long, slow reply for kill tests), "approval", "fail".
+// MOCK_TRANSCRIBE_MS delays speech-to-text (try 20000 to outlast the 15 s idle timeout).
+// Profiles: default (MOCK_KEY), orchestrator (hd-orch-key-7d3e9a1c5b), coder (no key).
 import http from "node:http";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -16,6 +18,9 @@ const API_PORT = Number(env.MOCK_API_PORT ?? 18642);
 const USER = env.MOCK_USER ?? "tester";
 const PASS = env.MOCK_PASS ?? "correct-horse-battery";
 const KEY = env.MOCK_KEY ?? "hd-test-key-4f9c2a7e1b";
+// Each Profile has its own API key, never the default's; "coder" is listed but has none.
+const PROFILES = ["default", "orchestrator", "coder"];
+const PROFILE_KEYS = { default: KEY, orchestrator: env.MOCK_ORCH_KEY ?? "hd-orch-key-7d3e9a1c5b" };
 const STATE_FILE = env.MOCK_STATE ?? "/tmp/hermes-mock-state.json";
 const KEEPALIVE_MS = 10_000;
 const TERMINAL = new Set(["run.completed", "run.failed", "run.cancelled"]);
@@ -115,9 +120,22 @@ serve(DASH_PORT, "dashboard", async (req, res, url) => {
       { "set-cookie": ["hermes_session_at=; Max-Age=0; Path=/", "hermes_session_rt=; Max-Age=0; Path=/"] },
     );
   }
+  const signedIn = env.MOCK_AUTH === "off" || state.access[cookieJar(req).hermes_session_at] > Date.now();
+  if (url.pathname.startsWith("/api/") && !signedIn) return send(res, 401, { detail: "Unauthorized" });
+  if (route === "GET /api/profiles") {
+    return send(res, 200, { profiles: PROFILES.map((name) => ({ name, is_default: name === "default" })) });
+  }
+  if (route === "GET /api/profiles/active") return send(res, 200, { active: "orchestrator", current: "default" });
+  if (route === "POST /api/audio/transcribe") {
+    const body = await readJson(req);
+    if (!body?.data_url?.startsWith("data:audio/") && !body?.data_url?.startsWith("data:video/webm")) {
+      return send(res, 400, { detail: "Payload must be an audio recording" });
+    }
+    await new Promise((resolve) => setTimeout(resolve, Number(env.MOCK_TRANSCRIBE_MS ?? 800)));
+    const profileName = url.searchParams.get("profile") ?? "default";
+    return send(res, 200, { ok: true, transcript: `hello from the mock microphone (${profileName})`, provider: "mock" });
+  }
   if (url.pathname.startsWith("/api/plugins/kanban/") || url.pathname.startsWith("/api/skills")) {
-    const jar = cookieJar(req);
-    if (env.MOCK_AUTH !== "off" && !(state.access[jar.hermes_session_at] > Date.now())) return send(res, 401, { detail: "Unauthorized" });
     return work(req, res, url);
   }
   send(res, 404, { detail: "Not Found" });
@@ -201,9 +219,9 @@ async function work(req, res, url) {
 const unauthorized = { error: { message: "Invalid gateway API key (API_SERVER_KEY)", type: "gateway_auth_error", code: "gateway_auth_failed" } };
 const notFound = (what) => ({ error: { message: `${what} not found`, type: "invalid_request_error", code: "not_found" } });
 
-function touchSession(id, preview) {
+function touchSession(id, preview, profile = "default") {
   state.sessions[id] ??= {
-    id, source: "api_server", title: null, model: "mock", started_at: now(), ended_at: null,
+    id, source: "api_server", profile, title: null, model: "mock", started_at: now(), ended_at: null,
     message_count: 0, tool_call_count: 0, parent_session_id: null, preview: null, pinned: false, archived: false,
   };
   state.messages[id] ??= [];
@@ -232,7 +250,7 @@ function describeInput(input) {
   return { content, text, names };
 }
 
-function startRun(runId, sessionId, prompt, attachments) {
+function startRun(runId, sessionId, prompt, attachments, via) {
   const run = { runId, sessionId, status: "running", events: [], subscribers: new Set(), stop: false, wake: null, createdAt: now() };
   runs.set(runId, run);
   const emit = (event, fields = {}) => {
@@ -257,7 +275,7 @@ function startRun(runId, sessionId, prompt, attachments) {
     }
   };
   (async () => {
-    await say(`You said: "${prompt.split("\n")[0].slice(0, 80)}". `);
+    await say(`[${via}] You said: "${prompt.split("\n")[0].slice(0, 80)}". `);
     if (attachments.length) await say(`I received ${attachments.length} attachment(s): ${attachments.join(", ")}. `);
     if (/tool/i.test(prompt) && !run.stop) {
       emit("tool.started", { tool: "terminal", preview: "ls -la ~/projects" });
@@ -326,7 +344,15 @@ function streamEvents(res, run, lastSeq) {
 
 serve(API_PORT, "api", async (req, res, url) => {
   if (req.headers.origin) return res.writeHead(403).end(); // non-allowlisted Origin: bare 403, like the real server
-  if (req.headers.authorization !== `Bearer ${KEY}`) return send(res, 401, unauthorized);
+  // /p/<profile>/... addresses a named Profile, like a multiplexing gateway.
+  let profile = "default";
+  const prefixed = url.pathname.match(/^\/p\/([^/]+)(\/.*)$/);
+  if (prefixed) {
+    profile = decodeURIComponent(prefixed[1]);
+    if (!PROFILES.includes(profile)) return send(res, 404, { error: "Unknown or unconfigured profile" });
+    url.pathname = prefixed[2];
+  }
+  if (!PROFILE_KEYS[profile] || req.headers.authorization !== `Bearer ${PROFILE_KEYS[profile]}`) return send(res, 401, unauthorized);
   const [, a, b, id, sub] = url.pathname.split("/").map(decodeURIComponent);
   const route = `${req.method} /${a}/${b}${id ? "/:id" : ""}${sub ? `/${sub}` : ""}`;
 
@@ -355,9 +381,10 @@ serve(API_PORT, "api", async (req, res, url) => {
     const runId = newId("run_");
     const sessionId = body.session_id ?? runId;
     const { content, text, names } = describeInput(body.input);
-    touchSession(sessionId, text.slice(0, 60));
+    touchSession(sessionId, text.slice(0, 60), profile);
     addMessage(sessionId, "user", content);
-    startRun(runId, sessionId, text, names);
+    const model = body.model ? `${body.provider ?? "?"}/${body.model}` : "profile default";
+    startRun(runId, sessionId, text, names, `${profile} · ${model} · reasoning ${body.model_options?.reasoning_effort ?? "default"}`);
     return send(res, 202, { run_id: runId, status: "started", replayed: false });
   }
   if (a === "v1" && b === "runs" && id) {
@@ -376,16 +403,24 @@ serve(API_PORT, "api", async (req, res, url) => {
       return send(res, 200, { run_id: id, status: "stopping" });
     }
   }
+  if (req.method === "GET" && url.pathname === "/api/model/options") {
+    if (env.MOCK_NO_MODELS === "1") return send(res, 500, { error: { message: "Failed to list model options.", code: "model_options_failed" } });
+    return send(res, 200, { provider: "mockai", model: "mock-large", providers: [
+      { slug: "mockai", name: "Mock AI", authenticated: true, models: ["mock-large", "mock-small"] },
+      { slug: "zai", name: "Z.ai", authenticated: true, models: ["glm-5.3-flash"] },
+      { slug: "nous", name: "Nous Portal", authenticated: false, models: ["hermes-5"] },
+    ] });
+  }
   if (route === "GET /api/sessions") {
     const limit = Math.min(Number(url.searchParams.get("limit") ?? 50), 200);
-    const all = Object.values(state.sessions).sort((x, y) => y.last_active - x.last_active);
+    const all = Object.values(state.sessions).filter((s) => (s.profile ?? "default") === profile).sort((x, y) => y.last_active - x.last_active);
     return send(res, 200, { object: "list", data: all.slice(0, limit), limit, offset: 0, has_more: all.length > limit });
   }
   if (route === "POST /api/sessions") {
     const body = (await readJson(req)) ?? {};
     const sid = body.id ?? newId("sess_");
     if (state.sessions[sid]) return send(res, 409, { error: { message: "Session already exists", code: "session_exists" } });
-    const session = touchSession(sid, null);
+    const session = touchSession(sid, null, profile);
     session.title = body.title ?? null;
     save();
     return send(res, 201, { object: "hermes.session", session });

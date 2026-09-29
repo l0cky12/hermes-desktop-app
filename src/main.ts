@@ -1,5 +1,11 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { field, h, icon, input } from "./dom";
+import { appearanceTab, applyAppearance } from "./appearance";
+import {
+  changeLabel, choiceKey, DEFAULT_CHOICE, loadChoice, REASONING_LEVELS, saveChoice, saveProfile, startProfile,
+  type Choice, type ModelChoice,
+} from "./prefs";
 
 type GatewayError = { kind: "unreachable" | "unauthorized" | "not_found" | "http" | "invalid"; message: string };
 type Init = { dashboard_url: string | null; api_url: string | null; ssh_host: string | null; keyring: boolean };
@@ -9,11 +15,13 @@ type RunEvent = { event: string; seq?: number; [field: string]: unknown };
 type StreamMsg = { type: "event"; data: RunEvent } | { type: "dropped"; message: string };
 type Session = { id: string; title?: string | null; preview?: string | null };
 type Message = { role: string; content: unknown; tool_calls?: { function?: { name?: string } }[] | null };
+type Attachment = { path: string } | { name: string; data_url: string };
+type Models = { default: ModelChoice | null; groups: { provider: string; name: string; models: string[] }[] };
 type TurnStatus = "streaming" | "done" | "stopped" | "failed" | "not-sent";
 
 interface Turn {
   text: string;
-  files: string[];
+  files: Attachment[];
   runId?: string;
   lastSeq: number;
   reply: string;
@@ -23,35 +31,21 @@ interface Turn {
   replyEl: HTMLElement;
   notice: HTMLElement;
   statusEl: HTMLElement;
+  choice: Choice;
 }
 
+applyAppearance();
 const app = document.querySelector<HTMLDivElement>("#app")!;
 const banner = document.querySelector<HTMLDivElement>("#banner")!;
 const dialog = document.querySelector<HTMLDialogElement>("#reauth")!;
 dialog.addEventListener("cancel", (e) => e.preventDefault()); // re-auth can't be dismissed, only completed
 
-function h<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  props: Partial<HTMLElementTagNameMap[K]> = {},
-  ...children: (Node | string)[]
-): HTMLElementTagNameMap[K] {
-  const el = Object.assign(document.createElement(tag), props);
-  el.append(...children);
-  return el;
-}
-
-function input(props: Partial<HTMLInputElement>): HTMLInputElement {
-  return h("input", { required: true, spellcheck: false, autocomplete: "off", ...props });
-}
-
-function field(label: string, control: HTMLElement): HTMLLabelElement {
-  return h("label", {}, h("span", { textContent: label }), control);
-}
-
 const asError = (e: unknown): GatewayError =>
-  typeof e === "object" && e !== null && "kind" in e ? (e as GatewayError) : { kind: "invalid", message: String(e) };
+  typeof e === "object" && e !== null && "kind" in e ? (e as GatewayError)
+  : { kind: "invalid", message: e instanceof Error ? e.message : String(e) };
 
 const basename = (path: string) => path.split(/[\\/]/).pop() ?? path;
+const attachmentName = (a: Attachment) => ("path" in a ? basename(a.path) : a.name);
 
 function noteSaved(saved: boolean) {
   if (!saved) {
@@ -67,6 +61,7 @@ async function boot() {
   app.replaceChildren(h("p", { className: "loading", textContent: "Opening the OS keyring… (unlock it if your system asks)" }));
   const init = await invoke<Init>("init");
   noteSaved(init.keyring);
+  connection = init.ssh_host ? `ssh:${init.ssh_host}` : init.dashboard_url && init.api_url ? connectionId(init.dashboard_url, init.api_url) : "";
   if (init.ssh_host) await connectSsh();
   else if (init.dashboard_url && init.api_url) await connect();
   else showPairing();
@@ -90,7 +85,7 @@ async function connect() {
       supported = await invoke<boolean>("capabilities");
     } catch (e) {
       if (asError(e).kind !== "unauthorized") throw e;
-      supported = (await reauth("key", "The API server did not accept the saved API key."))!;
+      supported = (await reauth("key", "The API server did not accept the saved API key.")) ?? false;
     }
     showChat(supported);
   } catch (e) {
@@ -204,6 +199,7 @@ function showPairing() {
         }
         noteSaved(accepted.saved);
         await invoke("finish_pairing");
+        connection = connectionId(dashUrl.value, apiUrl.value);
         showChat(accepted.runs);
       } catch (e) {
         formError.textContent = asError(e).message;
@@ -234,6 +230,7 @@ function showPairing() {
     sshResult.textContent = "Connecting…";
     try {
       await invoke("configure_ssh", { host: sshHost.value });
+      connection = `ssh:${sshHost.value.trim()}`;
       showChat(true, true);
     } catch (e) {
       sshResult.className = "error";
@@ -258,8 +255,9 @@ function showPairing() {
   );
 }
 
-/** Blocks until the rejected credential is replaced. For a new key, resolves with whether chat is supported. */
-function reauth(kind: "sign-in" | "key", reason: string): Promise<boolean | undefined> {
+/** Blocks until the rejected credential is replaced. For a new key, resolves with whether chat is supported;
+ *  with `cancel`, the prompt can also be left, resolving `null`. */
+function reauth(kind: "sign-in" | "key", reason: string, cancel?: string): Promise<boolean | undefined | null> {
   return new Promise((resolve) => {
     const user = input({ autocomplete: "username" });
     const pass = input({ type: "password" });
@@ -276,9 +274,10 @@ function reauth(kind: "sign-in" | "key", reason: string): Promise<boolean | unde
       h("div", { className: "row" }, submit, h("button", {
         type: "button",
         className: "secondary",
-        textContent: "Use a different gateway",
+        textContent: cancel ?? "Use a different gateway",
         onclick: () => {
           dialog.close();
+          if (cancel) return resolve(null);
           showPairing();
         },
       })),
@@ -317,11 +316,17 @@ function reauth(kind: "sign-in" | "key", reason: string): Promise<boolean | unde
 // ---- Chat ----
 
 let runs = false; // the API server accepts Runs and streams their events
+let connection = ""; // which Gateway or SSH host; Profiles and per-Session choices are remembered per connection
+let profile = "default";
+const connectionId = (dash: string, api: string) => `${new URL(dash).origin}|${new URL(api).origin}`;
 let signInRequired = true; // the Dashboard asks for Sign-in; without it, a 401 can't be fixed by signing in
 let overSsh = false; // Hermes over SSH (hermes acp): Approvals can be answered, Sessions can't be deleted
 let sessionId: string | null = null;
 let active: Turn | null = null;
-let pending: string[] = [];
+let pending: Attachment[] = [];
+let models: Models = { default: null, groups: [] };
+let choice: Choice = DEFAULT_CHOICE; // what the next Turn in this view runs on
+let lastChoice: Choice | undefined; // what the previous Turn ran on, for the reply label
 let ui: {
   sessions: HTMLUListElement;
   sessionsError: HTMLElement;
@@ -330,6 +335,17 @@ let ui: {
   input: HTMLTextAreaElement;
   send: HTMLButtonElement;
   drop: HTMLElement;
+  composerError: HTMLElement;
+  toolbar: HTMLElement;
+  spacer: HTMLElement;
+  profile: HTMLSelectElement;
+  modelPicker: HTMLElement;
+  modelLabel: HTMLElement;
+  menu: HTMLElement;
+  reasoning: HTMLSelectElement;
+  mic: HTMLButtonElement;
+  paperclip: HTMLButtonElement;
+  micTime: HTMLElement;
 } | null = null;
 
 function showChat(supported: boolean, ssh = false) {
@@ -341,11 +357,47 @@ function showChat(supported: boolean, ssh = false) {
     sessionsError: h("p", { className: "error" }),
     turns: h("div", { className: "turns" }),
     pending: h("div", { className: "pending" }),
-    input: h("textarea", { placeholder: runs ? "Message Hermes. Drop files to attach." : unavailable, rows: 3 }),
+    input: h("textarea", { placeholder: runs ? "Message Hermes. Drop, paste, or pick attachments." : unavailable, rows: 3 }),
     send: h("button", { textContent: "Send" }),
-    drop: h("div", { className: "drop", hidden: true, textContent: runs ? "Drop files to attach" : unavailable }),
+    drop: h("div", { className: "drop", hidden: true, textContent: runs ? "Drop to attach" : unavailable }),
+    composerError: h("p", { className: "error" }),
+    toolbar: h("div", { className: "toolbar" }),
+    spacer: h("span", { className: "spacer" }),
+    mic: h("button", { type: "button", className: "icon-btn", title: "Dictate" }),
+    micTime: h("span"),
+    paperclip: h("button", { type: "button", className: "icon-btn", title: "Add attachments" }, icon("paperclip")),
+    profile: h("select", { title: "Profile" }),
+    modelPicker: h("span", { className: "picker model" }),
+    modelLabel: h("span"),
+    menu: h("div", { className: "menu" }),
+    reasoning: h("select", {}, h("option", { value: "", textContent: "Default" }),
+      ...REASONING_LEVELS.map((r) => h("option", { value: r, textContent: r }))),
   };
   const { input: box, send: button } = ui;
+  const picker = h("input", { type: "file", multiple: true, hidden: true });
+  picker.onchange = async () => {
+    await addFiles([...(picker.files ?? [])]);
+    picker.value = "";
+  };
+  ui.paperclip.onclick = () => picker.click();
+  ui.toolbar.append(ui.paperclip, picker, ui.spacer, button);
+  ui.mic.append(icon("mic"), ui.micTime);
+  ui.mic.onclick = () => void toggleDictation();
+  // Speech-to-text is a Dashboard feature; over SSH there is no Dashboard.
+  ui.mic.hidden = overSsh || !navigator.mediaDevices?.getUserMedia;
+  ui.toolbar.insertBefore(ui.mic, picker.nextSibling);
+  box.onpaste = (e) => void pasteImages(e);
+  ui.profile.onchange = () => void useProfile(ui!.profile.value, profile);
+  ui.toolbar.insertBefore(h("span", { className: "picker profile", title: "Profile" }, icon("user"), ui.profile), ui.spacer);
+  ui.modelPicker.append(h("button", { type: "button", className: "icon-btn", title: "Model", onclick: toggleModelMenu }, icon("cpu"), ui.modelLabel, icon("chevron", 12)));
+  const reasoningPicker = h("span", { className: "picker", title: "Reasoning level" }, icon("brain"), ui.reasoning);
+  if (overSsh) {
+    ui.reasoning.disabled = true;
+    reasoningPicker.title = "Over SSH, the reasoning level is set in the profile's config";
+  }
+  ui.reasoning.onchange = () => setChoice({ ...choice, reasoning: ui!.reasoning.value || null });
+  ui.toolbar.insertBefore(ui.modelPicker, ui.spacer);
+  ui.toolbar.insertBefore(reasoningPicker, ui.spacer);
   box.onkeydown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -358,45 +410,165 @@ function showChat(supported: boolean, ssh = false) {
       "div",
       { className: "chat" },
       h("aside", {}, h("div", { className: "row" }, h("h2", { textContent: "Sessions" }),
-        h("button", { className: "secondary", textContent: "New chat", onclick: newChat })), ui.sessionsError, ui.sessions),
-      h("main", {}, ui.turns, ui.pending, h("div", { className: "composer" }, box, button)),
+        h("button", { className: "secondary", textContent: "New chat", onclick: newChat })), ui.sessionsError, ui.sessions,
+        h("footer", {}, h("button", { className: "icon-btn", title: "Settings", onclick: showSettings }, icon("settings"), "Settings"))),
+      h("main", {}, ui.turns, ui.pending, h("div", { className: "composer" }, h("div", { className: "composer-box" }, box, ui.toolbar))),
       ui.drop,
     ),
   );
+  renderPending(); // puts the composer error line on screen
   newChat();
   updateComposer();
-  refreshSessions();
+  void setupProfiles();
+}
+
+/** Settings takes the chat view's place in the shell until closed (or another rail view is picked); the chat keeps running underneath. */
+function showSettings() {
+  const chat = app.querySelector<HTMLElement>(".chat")!;
+  const view = h(
+    "div",
+    { className: "settings" },
+    h("nav", {}, h("h2", { textContent: "Settings" }), h("button", { textContent: "Appearance", ariaCurrent: "page" }),
+      h("button", { className: "secondary", textContent: "Back to chat", onclick: () => { view.remove(); chat.hidden = false; } })),
+    appearanceTab(),
+  );
+  chat.hidden = true;
+  chat.after(view);
 }
 
 getCurrentWebview().onDragDropEvent(({ payload }) => {
   if (!ui) return;
   ui.drop.hidden = payload.type === "drop" || payload.type === "leave";
   if (payload.type === "drop" && runs) {
-    pending.push(...payload.paths.filter((p) => !pending.includes(p)));
+    pending.push(...payload.paths.filter((p) => !pending.some((a) => "path" in a && a.path === p)).map((path) => ({ path })));
     renderPending();
   }
 });
 
+/** An Attachment chip: a thumbnail for images the webview holds, a paperclip otherwise. */
+function chip(a: Attachment, onRemove?: () => void): HTMLElement {
+  const thumb = "data_url" in a && a.data_url.startsWith("data:image/") ? h("img", { src: a.data_url, alt: "" }) : "📎";
+  const remove = onRemove ? [h("button", { className: "link", textContent: "×", title: "Remove attachment", onclick: onRemove })] : [];
+  return h("span", { className: "chip" }, thumb, attachmentName(a), ...remove);
+}
+
 function renderPending() {
   ui!.pending.replaceChildren(
-    ...pending.map((path) =>
-      h("span", { className: "chip" }, `📎 ${basename(path)}`, h("button", {
-        className: "link",
-        textContent: "×",
-        title: "Remove attachment",
-        onclick: () => {
-          pending = pending.filter((p) => p !== path);
-          renderPending();
-        },
-      })),
-    ),
+    ...pending.map((a) => chip(a, () => {
+      pending = pending.filter((p) => p !== a);
+      renderPending();
+    })),
+    ui!.composerError,
   );
+}
+
+const MAX_BYTES = 2 * 1024 * 1024; // attach.rs enforces it; checked here only to avoid reading huge files
+const SENDABLE = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+let pasted = 0;
+
+const dataUrl = (blob: Blob) =>
+  new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+
+async function addFiles(files: File[]) {
+  for (const file of files) {
+    if (file.size > MAX_BYTES) ui!.composerError.textContent = `Not attached: ${file.name} is larger than 2 MB`;
+    else pending.push({ name: file.name, data_url: await dataUrl(file) });
+  }
+  renderPending();
+}
+
+/** Screenshots are often over 2 MB or an unsendable type: re-encode as JPEG, shrinking until one fits. */
+async function fitImage(blob: Blob): Promise<Blob> {
+  if (blob.size <= MAX_BYTES && SENDABLE.includes(blob.type)) return blob;
+  const bitmap = await createImageBitmap(blob);
+  for (const scale of [1, 0.75, 0.5, 0.35]) {
+    const canvas = h("canvas", { width: Math.round(bitmap.width * scale), height: Math.round(bitmap.height * scale) });
+    const ctx = canvas.getContext("2d")!;
+    ctx.fillStyle = "#fff"; // JPEG has no transparency
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const jpeg = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
+    if (jpeg && jpeg.size <= MAX_BYTES) return jpeg;
+  }
+  throw new Error("the pasted image is too large even after compressing");
+}
+
+/** Pasted images become Attachments; any text in the clipboard still pastes as usual. */
+async function pasteImages(e: ClipboardEvent) {
+  const images = [...(e.clipboardData?.items ?? [])]
+    .filter((i) => i.kind === "file" && i.type.startsWith("image/"))
+    .map((i) => i.getAsFile())
+    .filter((f): f is File => f !== null);
+  if (!images.length || !runs) return;
+  for (const image of images) {
+    try {
+      const fitted = await fitImage(image);
+      const ext = fitted.type === "image/jpeg" ? "jpg" : fitted.type.split("/")[1];
+      pending.push({ name: `Pasted image ${++pasted}.${ext}`, data_url: await dataUrl(fitted) });
+    } catch (err) {
+      ui!.composerError.textContent = `Not attached: ${asError(err).message}`;
+    }
+  }
+  renderPending();
+}
+
+let recorder: MediaRecorder | null = null;
+const clock = (ms: number) => `${Math.floor(ms / 60_000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
+
+/** Dictation: click to record, click again to insert the transcript at the cursor. */
+async function toggleDictation() {
+  if (recorder) return recorder.stop();
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    ui!.composerError.textContent = `Microphone unavailable: ${asError(e).message}`;
+    return;
+  }
+  const rec = new MediaRecorder(stream);
+  const chunks: Blob[] = [];
+  const started = Date.now();
+  const tick = setInterval(() => (ui!.micTime.textContent = clock(Date.now() - started)), 250);
+  const limit = setTimeout(() => rec.stop(), 120_000); // ponytail: 2 min cap per note; chunked transcription if longer dictation matters
+  recorder = rec;
+  ui!.mic.dataset.recording = "";
+  ui!.mic.title = "Stop and transcribe";
+  ui!.composerError.textContent = "";
+  rec.ondataavailable = (e) => chunks.push(e.data);
+  rec.onstop = async () => {
+    clearInterval(tick);
+    clearTimeout(limit);
+    stream.getTracks().forEach((t) => t.stop());
+    recorder = null;
+    delete ui!.mic.dataset.recording;
+    ui!.mic.title = "Dictate";
+    ui!.micTime.textContent = "…";
+    ui!.mic.disabled = true;
+    try {
+      const text = await invoke<string>("transcribe", { dataUrl: await dataUrl(new Blob(chunks, { type: rec.mimeType })) });
+      const box = ui!.input;
+      if (text) box.setRangeText(text, box.selectionStart, box.selectionEnd, "end");
+      box.focus();
+    } catch (e) {
+      ui!.composerError.textContent = `Dictation failed: ${asError(e).message}`;
+    } finally {
+      ui!.micTime.textContent = "";
+      ui!.mic.disabled = false;
+    }
+  };
+  rec.start();
 }
 
 function updateComposer() {
   ui!.send.textContent = active ? "Stop" : "Send";
   ui!.send.disabled = !runs || (active !== null && !active.runId);
   ui!.input.disabled = !runs;
+  ui!.paperclip.disabled = !runs;
 }
 
 const FENCE = /```(?:[^\n`]*\n)?([\s\S]*?)```/;
@@ -425,11 +597,11 @@ function scrollToEnd() {
   ui!.turns.scrollTop = ui!.turns.scrollHeight;
 }
 
-function addTurn(text: string, files: string[]): Turn {
+function addTurn(text: string, files: Attachment[]): Turn {
   ui!.turns.querySelector(".empty")?.remove();
   const user = h("div", { className: "user" });
   renderText(user, text);
-  if (files.length) user.append(h("div", { className: "files" }, ...files.map((f) => h("span", { className: "chip", textContent: `📎 ${basename(f)}` }))));
+  if (files.length) user.append(h("div", { className: "files" }, ...files.map((f) => chip(f))));
   const turn: Turn = {
     text,
     files,
@@ -441,6 +613,7 @@ function addTurn(text: string, files: string[]): Turn {
     replyEl: h("div", { className: "reply" }),
     notice: h("p", { className: "notice" }),
     statusEl: h("div", { className: "status" }),
+    choice: DEFAULT_CHOICE,
   };
   turn.root.append(...(text || files.length ? [user] : []), turn.tools, turn.replyEl, turn.notice, turn.statusEl);
   ui!.turns.append(turn.root);
@@ -485,7 +658,12 @@ async function send() {
   const text = ui!.input.value.trim();
   if (!text && !pending.length) return;
   const turn = addTurn(text, pending);
+  turn.choice = choice;
+  const label = changeLabel(lastChoice, choice);
+  lastChoice = choice;
+  if (label) turn.replyEl.after(h("div", { className: "model-label", textContent: label }));
   pending = [];
+  ui!.composerError.textContent = "";
   renderPending();
   ui!.input.value = "";
   await beginRun(turn);
@@ -502,7 +680,9 @@ async function beginRun(turn: Turn) {
   setStatus(turn, "streaming");
   let run: RunStarted;
   try {
-    run = await invoke<RunStarted>("start_run", { sessionId, text: turn.text, files: turn.files });
+    run = await invoke<RunStarted>("start_run", {
+      sessionId, text: turn.text, files: turn.files, model: turn.choice.model, reasoning: turn.choice.reasoning,
+    });
   } catch (e) {
     const x = asError(e);
     setStatus(turn, "not-sent", `Not sent: ${x.message}`);
@@ -515,6 +695,7 @@ async function beginRun(turn: Turn) {
   }
   turn.runId = run.run_id;
   sessionId = run.session_id;
+  saveChoice(localStorage, choiceKey(connection, profile, run.session_id), choice);
   updateComposer();
   try {
     await openStream(turn);
@@ -523,8 +704,8 @@ async function beginRun(turn: Turn) {
   }
 }
 
-function setRuns(next: boolean | undefined) {
-  if (next !== undefined) runs = next;
+function setRuns(next: boolean | undefined | null) {
+  if (typeof next === "boolean") runs = next;
   updateComposer();
 }
 
@@ -604,13 +785,13 @@ function stop() {
   const turn = active;
   if (!turn?.runId) return;
   setStatus(turn, "stopped", "Stopped");
-  invoke("stop_run", { runId: turn.runId });
+  return invoke("stop_run", { runId: turn.runId });
 }
 
 /** Leaving a Session stops its streaming Turn so nothing keeps writing into a closed view. */
 function leave() {
-  if (active?.runId) stop();
-  else if (active) setStatus(active, "stopped", "Stopped");
+  if (active?.runId) return stop();
+  if (active) setStatus(active, "stopped", "Stopped");
 }
 
 function markCurrent() {
@@ -620,13 +801,19 @@ function markCurrent() {
 function newChat() {
   leave();
   sessionId = null;
-  ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "New chat. Type a message, or drop files to attach them." }));
+  choice = DEFAULT_CHOICE;
+  lastChoice = DEFAULT_CHOICE; // a choice made before the first message is a change too
+  renderChoice();
+  ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "New chat. Type a message, or drop attachments here." }));
   markCurrent();
 }
 
 async function openSession(id: string) {
   leave();
   sessionId = id;
+  choice = loadChoice(localStorage, choiceKey(connection, profile, id));
+  lastChoice = choice;
+  renderChoice();
   markCurrent();
   ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "Loading…" }));
   try {
@@ -690,29 +877,128 @@ async function refreshSessions() {
   markCurrent();
 }
 
+/** Fills the Profile selector and opens this connection's starting Profile. */
+async function setupProfiles() {
+  let list: { names: string[]; gateway_default: string | null };
+  try {
+    list = await invoke("list_profiles");
+  } catch (e) {
+    ui!.sessionsError.textContent = `Couldn't list profiles: ${asError(e).message}`;
+    list = { names: ["default"], gateway_default: null };
+  }
+  if (!list.names.length) list.names = ["default"];
+  ui!.profile.replaceChildren(...list.names.map((n) => h("option", { value: n, textContent: n })));
+  const start = startProfile(localStorage, connection, list.names, list.gateway_default);
+  await useProfile(start, start === "default" || !list.names.includes("default") ? null : "default");
+}
+
+/** Switches the whole view to a Profile: its Sessions, its API key, and a new chat, or `session` when going back. */
+async function useProfile(name: string, previous: string | null, session: string | null = null) {
+  const back = sessionId; // where "Back to <previous>" returns
+  await leave()?.catch(() => {}); // the Stop must reach the old Profile before requests switch to the new one
+  try {
+    await invoke("set_profile", { name });
+    if (!overSsh) {
+      const supported = await profileKey(name, previous);
+      if (supported === null) return void (previous && (await useProfile(previous, null, back)));
+      setRuns(supported);
+    }
+  } catch (e) {
+    ui!.sessionsError.textContent = `Couldn't open the ${name} profile: ${asError(e).message}`;
+    if (previous) await useProfile(previous, null, back);
+    return;
+  }
+  if (name !== profile) {
+    pending = []; // Attachments stay with the Profile they were added under
+    renderPending();
+  }
+  profile = name;
+  ui!.profile.value = name;
+  saveProfile(localStorage, connection, name);
+  ui!.sessionsError.textContent = "";
+  if (session) void openSession(session);
+  else newChat();
+  await Promise.all([refreshSessions(), refreshModels()]);
+}
+
+/** Over HTTP each named Profile has its own API key: asks once, and the keyring keeps it. `null` = went back. */
+async function profileKey(name: string, previous: string | null): Promise<boolean | null> {
+  try {
+    return await invoke<boolean>("capabilities");
+  } catch (e) {
+    if (asError(e).kind !== "unauthorized") throw e;
+    const reason = `The ${name} profile has its own API key (API_SERVER_KEY in that profile's .env). Enter it once; it's saved with your other credentials.`;
+    const supported = await reauth("key", reason, previous ? `Back to ${previous}` : undefined);
+    return supported === null ? null : supported ?? false;
+  }
+}
+
+async function refreshModels() {
+  try {
+    models = await invoke<Models>("list_models");
+    ui!.modelPicker.title = "Model";
+  } catch (e) {
+    models = { default: null, groups: [] };
+    ui!.modelPicker.title = `Couldn't list models: ${asError(e).message}. Runs use the profile's default.`;
+  }
+  renderChoice();
+}
+
+const modelLabel = (m: ModelChoice | null) => m?.model ?? `Profile default${models.default ? ` (${models.default.model})` : ""}`;
+
+function renderChoice() {
+  ui!.modelLabel.textContent = modelLabel(choice.model);
+  ui!.reasoning.value = choice.reasoning ?? "";
+}
+
+/** Takes effect from the next Turn, and is saved per Session once the Session exists. */
+function setChoice(next: Choice) {
+  choice = next;
+  if (sessionId) saveChoice(localStorage, choiceKey(connection, profile, sessionId), choice);
+  renderChoice();
+}
+
+/** The CPU picker: set-up providers only, grouped, filtered by the search box. */
+function toggleModelMenu() {
+  const { menu, modelPicker } = ui!;
+  if (menu.isConnected) return menu.remove();
+  const search = h("input", { type: "search", placeholder: "Search models", required: false });
+  const list = h("div");
+  const item = (label: string, m: ModelChoice | null) => {
+    const b = h("button", { type: "button", textContent: label, onclick: () => (setChoice({ ...choice, model: m }), menu.remove()) });
+    b.ariaSelected = String(JSON.stringify(m) === JSON.stringify(choice.model));
+    return b;
+  };
+  const render = () => {
+    const q = search.value.trim().toLowerCase();
+    const groups = models.groups
+      .map((g) => ({ ...g, models: g.models.filter((m) => `${g.name} ${m}`.toLowerCase().includes(q)) }))
+      .filter((g) => g.models.length);
+    const fallback = modelLabel(null).toLowerCase().includes(q) ? [item(modelLabel(null), null)] : [];
+    list.replaceChildren(
+      ...fallback,
+      ...groups.flatMap((g) => [h("h3", { textContent: g.name }), ...g.models.map((m) => item(m, { provider: g.provider, model: m }))]),
+      ...(groups.length || (q && fallback.length) ? [] : [h("p", { textContent: q ? "No matching models" : modelPicker.title })]),
+    );
+  };
+  search.oninput = render;
+  search.onkeydown = (e) => void (e.key === "Escape" && menu.remove());
+  render();
+  menu.replaceChildren(search, list);
+  modelPicker.append(menu);
+  search.focus();
+}
+
+document.addEventListener("pointerdown", (e) => {
+  if (ui && !ui.modelPicker.contains(e.target as Node)) ui.menu.remove();
+});
+
 // ---- Shell: icon rail and views ----
 
 type View = { el: HTMLElement; show?: () => void; hide?: () => void };
 type ViewName = "chat" | "kanban" | "skills" | "logs";
 
-const SVG = "http://www.w3.org/2000/svg";
-const ICONS: Record<ViewName, string> = {
-  chat: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z",
-  kanban: "M3 3h18v18H3z M9 3v18 M15 3v18",
-  skills: "M12 2 2 7l10 5 10-5-10-5z M2 17l10 5 10-5 M2 12l10 5 10-5",
-  logs: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6 M16 13H8 M16 17H8 M10 9H8",
-};
 const LABELS: Record<ViewName, string> = { chat: "Chat", kanban: "Kanban", skills: "Skills", logs: "Logs" };
-
-function icon(d: string): SVGSVGElement {
-  const svg = document.createElementNS(SVG, "svg");
-  svg.setAttribute("viewBox", "0 0 24 24");
-  svg.setAttribute("aria-hidden", "true");
-  const path = document.createElementNS(SVG, "path");
-  path.setAttribute("d", d);
-  svg.append(path);
-  return svg;
-}
 
 let current: View | null = null;
 
@@ -730,11 +1016,12 @@ function mountShell(chat: HTMLElement) {
     const button = h("button", { className: "rail-item", title: LABELS[name], onclick: () => select(name) });
     button.setAttribute("aria-label", LABELS[name]);
     button.dataset.view = name;
-    button.append(icon(ICONS[name]));
+    button.append(icon(name));
     return button;
   });
   function select(name: ViewName) {
     current?.hide?.();
+    app.querySelector(".settings")?.remove();
     for (const [n, v] of Object.entries(views)) v.el.hidden = n !== name;
     for (const b of buttons) b.setAttribute("aria-current", String(b.dataset.view === name));
     current = views[name];

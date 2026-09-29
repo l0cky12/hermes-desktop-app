@@ -3,6 +3,7 @@
 //! is a secret, and the remote Hermes owns all Session state.
 
 use crate::gateway::Error;
+use crate::picker::{model_switch, parse_profile_list, ModelChoice, Profiles};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -15,11 +16,17 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const HOME_MARK: &str = "hermes-desktop-home ";
-/// Prints the remote home (the cwd for new Sessions), then becomes Hermes. The installer puts
-/// `hermes` in ~/.local/bin, which non-interactive SSH shells often leave off PATH.
+/// Makes `hermes` findable: the installer puts it in ~/.local/bin, which non-interactive SSH
+/// shells often leave off PATH.
 // ponytail: POSIX-shell syntax; a fish/nushell login shell needs `ssh host sh -c ...` instead.
-const REMOTE: &str =
-    "printf 'hermes-desktop-home %s\\n' \"$HOME\"; PATH=\"$HOME/.local/bin:$PATH\" exec hermes acp";
+const HERMES: &str = "PATH=\"$HOME/.local/bin:$PATH\" exec hermes";
+
+/// Prints the remote home (the cwd for new Sessions), then becomes Hermes for the given Profile.
+/// `profile` has passed `picker::valid_profile`, which is what makes it safe in this command.
+fn remote(profile: Option<&str>) -> String {
+    let args = profile.map(|p| format!("-p {p} acp")).unwrap_or_else(|| "acp".into());
+    format!("printf 'hermes-desktop-home %s\\n' \"$HOME\"; {HERMES} {args}")
+}
 
 /// Accepts `host`, `user@host`, or an ssh_config alias. Anything that ssh could read as an
 /// option, or that splits into several arguments, is refused.
@@ -52,20 +59,28 @@ pub struct Conn {
     pub home: String,
     /// Each listed Session's own cwd, so loading it doesn't move it.
     pub cwds: Mutex<HashMap<String, String>>,
+    /// `models` from the last `session/new` answer: the list and the Profile's default.
+    models: Mutex<Option<Value>>,
+    /// The model id each Session is on, as last reported by `session/new`/`session/load` or set here.
+    current: Mutex<HashMap<String, String>>,
     _child: Child,
 }
 
-/// Starts `ssh host hermes acp` and completes the ACP handshake.
-pub async fn connect(host: &str) -> Result<Arc<Conn>, Error> {
+/// `ssh host <command>`. `host` has passed `valid_host`.
+fn ssh(host: &str, command: &str) -> Command {
     // Tests point this at a shim that runs the remote command locally (see mock/fake-ssh).
-    let ssh = std::env::var_os("HERMES_DESKTOP_SSH").unwrap_or_else(|| "ssh".into());
-    let mut child = Command::new(ssh)
-        // BatchMode: no password or host-key prompt nobody could answer; keys or ssh-agent only.
-        .args(["-T", "-o", "BatchMode=yes", "--", host, REMOTE])
+    let mut ssh = Command::new(std::env::var_os("HERMES_DESKTOP_SSH").unwrap_or_else(|| "ssh".into()));
+    // BatchMode: no password or host-key prompt nobody could answer; keys or ssh-agent only.
+    ssh.args(["-T", "-o", "BatchMode=yes", "--", host, command]).kill_on_drop(true);
+    ssh
+}
+
+/// Starts `ssh host hermes acp` and completes the ACP handshake.
+pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Error> {
+    let mut child = ssh(host, &remote(profile))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
         .spawn()
         .map_err(|e| Error::Unreachable(format!("Could not run ssh: {e}")))?;
     let stderr = tokio::spawn(tail(BufReader::new(child.stderr.take().expect("piped")).lines()));
@@ -90,6 +105,8 @@ pub async fn connect(host: &str) -> Result<Arc<Conn>, Error> {
         closed: Mutex::default(),
         home,
         cwds: Mutex::default(),
+        models: Mutex::default(),
+        current: Mutex::default(),
         _child: child,
     });
     tokio::spawn(read(conn.clone(), lines, stderr));
@@ -98,6 +115,20 @@ pub async fn connect(host: &str) -> Result<Arc<Conn>, Error> {
     conn.request("initialize", init).await?;
     crate::log::write("acp", format!("connected to {host}"));
     Ok(conn)
+}
+
+/// `hermes profile list` on the host (a second, short SSH call), parsed.
+pub async fn list_profiles(host: &str) -> Result<Profiles, Error> {
+    let mut command = ssh(host, &format!("{HERMES} profile list"));
+    command.stdin(Stdio::null());
+    let out = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .map_err(|_| Error::Unreachable(format!("No answer from {host} within 30 s")))?
+        .map_err(|e| Error::Unreachable(format!("Could not run ssh: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Unreachable(exited(String::from_utf8_lossy(&out.stderr).into_owned())));
+    }
+    Ok(parse_profile_list(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// The last few stderr lines: ssh's own errors, or why Hermes stopped.
@@ -202,7 +233,34 @@ impl Conn {
             return Err(Error::Unreachable(self.closed_reason()));
         }
         self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })).await?;
-        rx.await.unwrap_or_else(|_| Err(Error::Unreachable(self.closed_reason())))
+        let result = rx.await.unwrap_or_else(|_| Err(Error::Unreachable(self.closed_reason())));
+        if method == "session/new" {
+            if let Ok(created) = &result {
+                *self.models.lock().unwrap() = Some(created["models"].clone());
+            }
+        }
+        result
+    }
+
+    pub fn models(&self) -> Option<Value> {
+        self.models.lock().unwrap().clone()
+    }
+
+    /// Records the model a `session/new` or `session/load` answer says the Session is on.
+    pub fn note_model(&self, session: &str, answer: &Value) {
+        if let Some(id) = answer["models"]["currentModelId"].as_str() {
+            self.current.lock().unwrap().insert(session.to_owned(), id.to_owned());
+        }
+    }
+
+    /// Switches the Session's model between Turns, only when it's on another one than chosen.
+    pub async fn use_model(&self, session: &str, model: Option<&ModelChoice>) -> Result<(), Error> {
+        let current = self.current.lock().unwrap().get(session).cloned();
+        let default = self.models().and_then(|m| m["currentModelId"].as_str().map(str::to_owned));
+        let Some(wanted) = model_switch(model, current.as_deref(), default.as_deref()) else { return Ok(()) };
+        self.request("session/set_model", json!({ "sessionId": session, "modelId": wanted })).await?;
+        self.current.lock().unwrap().insert(session.to_owned(), wanted);
+        Ok(())
     }
 
     /// Routes a Session's updates to the returned receiver until `unsubscribe` or disconnect.
@@ -358,7 +416,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn lists_and_loads_sessions_from_real_hermes() {
-        let conn = connect("localhost").await.unwrap();
+        let conn = connect("localhost", None).await.unwrap();
         assert!(conn.home.starts_with('/'));
         let page = conn.request("session/list", json!({})).await.unwrap();
         let first = &page["sessions"][0];

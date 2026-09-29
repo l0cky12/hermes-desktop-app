@@ -20,15 +20,21 @@ pub enum Error {
     Invalid(String),
 }
 
-pub fn client() -> Client {
+fn builder() -> reqwest::ClientBuilder {
     Client::builder()
         // Never route credentials through a proxy host or follow a redirect off the gateway.
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
-        .read_timeout(IDLE_TIMEOUT)
-        .build()
-        .expect("static client config")
+}
+
+pub fn client() -> Client {
+    builder().read_timeout(IDLE_TIMEOUT).build().expect("static client config")
+}
+
+/// For a reply the server works on silently (speech-to-text): no idle cutoff, 2 min in total.
+pub fn slow_client() -> Client {
+    builder().timeout(Duration::from_secs(120)).build().expect("static client config")
 }
 
 /// Accepts `http(s)://host[:port]` only: no credentials, path, query, or fragment.
@@ -50,10 +56,13 @@ pub fn parse_origin(input: &str) -> Result<Url, Error> {
     Ok(url)
 }
 
-/// Joins path segments onto an origin, percent-encoding each one (session ids included).
-pub fn endpoint(origin: &Url, segments: &[&str]) -> Url {
+/// Joins path segments onto an origin, percent-encoding each one (session ids included), plus query pairs.
+pub fn endpoint(origin: &Url, segments: &[&str], query: &[(&str, &str)]) -> Url {
     let mut url = origin.clone();
     url.path_segments_mut().expect("http(s) origin").pop_if_empty().extend(segments);
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query); // even an empty extend would leave a bare `?`
+    }
     url
 }
 
@@ -134,7 +143,8 @@ mod tests {
     #[test]
     fn endpoint_encodes_segments() {
         let base = parse_origin("http://h:8642").unwrap();
-        assert_eq!(endpoint(&base, &["api", "sessions", "../x"]).as_str(), "http://h:8642/api/sessions/..%2Fx");
+        assert_eq!(endpoint(&base, &["api", "sessions", "../x"], &[]).as_str(), "http://h:8642/api/sessions/..%2Fx");
+        assert_eq!(endpoint(&base, &["api"], &[("profile", "a b")]).as_str(), "http://h:8642/api?profile=a+b");
     }
 
     #[test]

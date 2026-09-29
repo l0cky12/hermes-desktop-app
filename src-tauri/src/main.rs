@@ -2,6 +2,7 @@ mod acp;
 mod attach;
 mod gateway;
 mod log;
+mod picker;
 mod remote;
 mod sse;
 mod work;
@@ -14,6 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use tauri::webview::{PermissionKind, PermissionResponse};
 use tauri::{async_runtime, ipc::Channel, DragDropEvent, Manager, State, WindowEvent};
 
 const KEYRING_SERVICE: &str = "local.hermes-desktop";
@@ -37,6 +39,9 @@ struct Creds {
     api_url: String,
     api_key: Option<String>,
     cookies: BTreeMap<String, String>,
+    /// Named Profiles' own API keys; `api_key` is the default Profile's.
+    #[serde(default)]
+    profile_keys: BTreeMap<String, String>,
 }
 
 #[derive(PartialEq)]
@@ -53,10 +58,38 @@ struct Inner {
     creds: Creds,
     keyring: bool,
     run_stop: bool,
+    /// The Profile this app is showing (already `picker::valid_profile`); `None` until the chat
+    /// view picks one. Over SSH, `None` runs plain `hermes acp`, meaning the Gateway's default.
+    profile: Option<String>,
+}
+
+impl Inner {
+    fn named_profile(&self) -> Option<&str> {
+        self.profile.as_deref().filter(|p| *p != "default")
+    }
+
+    fn api_key(&self) -> Option<&str> {
+        match self.named_profile() {
+            Some(p) => self.creds.profile_keys.get(p).map(String::as_str),
+            None => self.creds.api_key.as_deref(),
+        }
+    }
+
+    /// Replaces the current Profile's API key, returning the old one (for rollback).
+    fn replace_key(&mut self, key: Option<String>) -> Option<String> {
+        match self.named_profile().map(str::to_owned) {
+            Some(p) => match key {
+                Some(k) => self.creds.profile_keys.insert(p, k),
+                None => self.creds.profile_keys.remove(&p),
+            },
+            None => std::mem::replace(&mut self.creds.api_key, key),
+        }
+    }
 }
 
 struct AppState {
     client: reqwest::Client,
+    slow_client: reqwest::Client,
     settings_path: PathBuf,
     inner: Mutex<Inner>,
     streams: Mutex<HashMap<String, async_runtime::JoinHandle<()>>>,
@@ -83,26 +116,19 @@ impl AppState {
     fn dashboard(&self, method: Method, path: &[&str], query: &[(&str, &str)]) -> Result<RequestBuilder, Error> {
         let inner = self.lock();
         let gateway = inner.gateway.as_ref().ok_or_else(not_configured)?;
-        let mut url = endpoint(&gateway.dashboard, path);
-        if !query.is_empty() {
-            url.query_pairs_mut().extend_pairs(query);
-        }
-        let request = self.client.request(method, url);
+        let request = self.client.request(method, endpoint(&gateway.dashboard, path, query));
         Ok(match inner.creds.cookies.is_empty() {
             true => request,
             false => request.header(header::COOKIE, cookie_header(&inner.creds.cookies)),
         })
     }
 
-    /// API server request; the API key is only ever attached here.
+    /// API server request for the current Profile; its API key is only ever attached here.
     fn api(&self, method: Method, path: &[&str], query: &[(&str, &str)]) -> Result<RequestBuilder, Error> {
         let inner = self.lock();
         let gateway = inner.gateway.as_ref().ok_or_else(not_configured)?;
-        let key = inner.creds.api_key.as_deref().ok_or_else(|| Error::Unauthorized("No API key saved".into()))?;
-        let mut url = endpoint(&gateway.api, path);
-        if !query.is_empty() {
-            url.query_pairs_mut().extend_pairs(query);
-        }
+        let key = inner.api_key().ok_or_else(|| Error::Unauthorized("No API key saved for this profile".into()))?;
+        let url = endpoint(&gateway.api, &picker::api_segments(inner.profile.as_deref(), path), query);
         Ok(self.client.request(method, url).bearer_auth(key))
     }
 
@@ -147,8 +173,11 @@ impl AppState {
         if let Some(conn) = slot.as_ref().filter(|c| c.alive()) {
             return Ok(conn.clone());
         }
-        let host = self.lock().ssh_host.clone().ok_or_else(not_configured)?;
-        let conn = acp::connect(&host).await?;
+        let (host, profile) = {
+            let inner = self.lock();
+            (inner.ssh_host.clone().ok_or_else(not_configured)?, inner.profile.clone())
+        };
+        let conn = acp::connect(&host, profile.as_deref()).await?;
         *slot = Some(conn.clone());
         Ok(conn)
     }
@@ -206,7 +235,7 @@ fn load_creds() -> (Option<Creds>, bool) {
 fn save_creds(creds: Creds) -> bool {
     let result = bounded(move || {
         let entry = keyring_entry()?;
-        if creds.api_key.is_none() && creds.cookies.is_empty() {
+        if creds.api_key.is_none() && creds.cookies.is_empty() && creds.profile_keys.is_empty() {
             match entry.delete_credential() {
                 Err(keyring::Error::NoEntry) => Ok(()),
                 other => other,
@@ -282,6 +311,7 @@ async fn configure(state: State<'_, AppState>, dashboard_url: String, api_url: S
         let changed = inner.gateway.as_ref() != Some(&gateway);
         inner.ssh_host = None;
         if changed {
+            inner.profile = None;
             inner.creds = Creds {
                 dashboard_url: gateway.dashboard.to_string(),
                 api_url: gateway.api.to_string(),
@@ -362,11 +392,11 @@ struct KeyAccepted {
 /// Keeps the key only if `/v1/capabilities` accepts it.
 #[tauri::command]
 async fn set_api_key(state: State<'_, AppState>, key: String) -> Result<KeyAccepted, Error> {
-    let previous = state.lock().creds.api_key.replace(key.trim().to_owned());
+    let previous = state.lock().replace_key(Some(key.trim().to_owned()));
     match capabilities(state.clone()).await {
         Ok(runs) => Ok(KeyAccepted { runs, saved: state.persist().await }),
         Err(e) => {
-            state.lock().creds.api_key = previous;
+            state.lock().replace_key(previous);
             Err(e)
         }
     }
@@ -392,6 +422,7 @@ async fn configure_ssh(state: State<'_, AppState>, host: String) -> Result<(), E
         inner.gateway = None;
         inner.creds = Creds::default();
         inner.ssh_host = Some(host.clone());
+        inner.profile = None;
     }
     state.hermes.lock().await.take();
     state.persist().await;
@@ -402,6 +433,62 @@ async fn configure_ssh(state: State<'_, AppState>, host: String) -> Result<(), E
 #[tauri::command]
 async fn connect_ssh(state: State<'_, AppState>) -> Result<(), Error> {
     state.hermes().await.map(drop)
+}
+
+/// Profiles to offer, and the Gateway's default Profile, which this app never changes.
+#[tauri::command]
+async fn list_profiles(state: State<'_, AppState>) -> Result<picker::Profiles, Error> {
+    if state.ssh() {
+        let host = state.lock().ssh_host.clone().ok_or_else(not_configured)?;
+        let profiles = acp::list_profiles(&host).await?;
+        // Plain `hermes acp` (no Profile picked yet) runs the Gateway's default, so picking that
+        // one next doesn't restart Hermes.
+        state.lock().profile.get_or_insert_with(|| profiles.gateway_default.clone().unwrap_or_else(|| "default".into()));
+        return Ok(profiles);
+    }
+    let get = |path: &'static [&'static str]| state.dashboard(Method::GET, path, &[]);
+    let list = json_body(send(&state.client, get(&["api", "profiles"])?).await?).await?;
+    let active = json_body(send(&state.client, get(&["api", "profiles", "active"])?).await?).await?;
+    Ok(picker::from_dashboard(&list, &active))
+}
+
+/// Switches Profile. Over HTTP, later requests go to `/p/<name>/` with that Profile's own key;
+/// over SSH, Hermes restarts as `hermes -p <name> acp`.
+#[tauri::command]
+async fn set_profile(state: State<'_, AppState>, name: String) -> Result<(), Error> {
+    let name = picker::valid_profile(&name)?;
+    let changed = state.lock().profile.replace(name.clone()) != Some(name);
+    if changed && state.ssh() {
+        state.hermes.lock().await.take();
+        state.acp_runs.lock().unwrap().clear();
+    }
+    Ok(())
+}
+
+/// Set-up providers and their models for the current Profile.
+#[tauri::command]
+async fn list_models(state: State<'_, AppState>) -> Result<picker::Models, Error> {
+    if state.ssh() {
+        let hermes = state.hermes().await?;
+        if let Some(models) = hermes.models() {
+            return Ok(picker::from_acp(&models));
+        }
+        // ponytail: an unused Session per connection; Hermes never lists one with no messages.
+        let created = hermes.request("session/new", json!({ "cwd": hermes.home, "mcpServers": [] })).await?;
+        return Ok(picker::from_acp(&created["models"]));
+    }
+    let request = state.api(Method::GET, &["api", "model", "options"], &[])?;
+    Ok(picker::from_options(&json_body(send(&state.client, request).await?).await?))
+}
+
+/// Dictation: the Dashboard transcribes with the current Profile's speech-to-text settings.
+#[tauri::command]
+async fn transcribe(state: State<'_, AppState>, data_url: String) -> Result<String, Error> {
+    let profile = state.lock().profile.clone();
+    let query: Vec<(&str, &str)> = profile.as_deref().map(|p| vec![("profile", p)]).unwrap_or_default();
+    let request = state.dashboard(Method::POST, &["api", "audio", "transcribe"], &query)?.json(&json!({ "data_url": data_url }));
+    let body = json_body(send(&state.slow_client, request).await?).await?;
+    Ok(body["transcript"].as_str().unwrap_or_default().to_owned())
 }
 
 /// Answers an Approval request from Hermes over SSH; `None` denies by cancelling.
@@ -453,6 +540,7 @@ async fn session_messages(state: State<'_, AppState>, id: String) -> Result<Valu
         if loaded.is_null() {
             return Err(Error::NotFound("Hermes has no such session".into()));
         }
+        hermes.note_model(&id, &loaded);
         return Ok(json!(acp::history(&replay)));
     }
     let request = state.api(Method::GET, &["api", "sessions", &id, "messages"], &[])?;
@@ -480,10 +568,20 @@ async fn start_run(
     state: State<'_, AppState>,
     session_id: Option<String>,
     text: String,
-    files: Vec<PathBuf>,
+    files: Vec<attach::Source>,
+    model: Option<picker::ModelChoice>,
+    reasoning: Option<String>,
 ) -> Result<RunStarted, Error> {
-    if let Some(stray) = files.iter().find(|f| !state.dropped.lock().unwrap().contains(*f)) {
-        return Err(Error::Invalid(format!("{} was not dropped into this window", stray.display())));
+    let reasoning = reasoning.map(|r| picker::valid_reasoning(&r)).transpose()?;
+    let stray = {
+        let dropped = state.dropped.lock().unwrap();
+        files.iter().find_map(|f| match f {
+            attach::Source::Dropped { path } if !dropped.contains(path) => Some(path.display().to_string()),
+            _ => None,
+        })
+    };
+    if let Some(stray) = stray {
+        return Err(Error::Invalid(format!("{stray} was not dropped into this window")));
     }
     let input = attach::build_input(&text, &files).map_err(Error::Invalid)?;
     if state.ssh() {
@@ -492,19 +590,19 @@ async fn start_run(
             Some(id) => id,
             None => {
                 let created = hermes.request("session/new", json!({ "cwd": hermes.home, "mcpServers": [] })).await?;
-                created["sessionId"].as_str().ok_or_else(|| Error::Http("Session created without an id".into()))?.to_owned()
+                let id = created["sessionId"].as_str().ok_or_else(|| Error::Http("Session created without an id".into()))?;
+                hermes.note_model(id, &created);
+                id.to_owned()
             }
         };
+        hermes.use_model(&session, model.as_ref()).await?;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let run_id = format!("acp-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let run = AcpRun { session: session.clone(), prompt: Some(acp::prompt_blocks(input)) };
         state.acp_runs.lock().unwrap().insert(run_id.clone(), run);
         return Ok(RunStarted { run_id, session_id: session });
     }
-    let mut body = json!({ "input": input });
-    if let Some(id) = &session_id {
-        body["session_id"] = json!(id);
-    }
+    let body = picker::run_body(input, session_id.as_deref(), model.as_ref(), reasoning.as_deref());
     let request = state.api(Method::POST, &["v1", "runs"], &[])?.json(&body);
     let response = json_body(send(&state.client, request).await?).await?;
     let run_id = response["run_id"].as_str().ok_or_else(|| Error::Http("Run created without a run_id".into()))?;
@@ -787,6 +885,7 @@ fn main() {
             let gateway = settings.as_ref().filter(|_| ssh_host.is_none()).and_then(|s| load_gateway(s, &settings_path));
             app.manage(AppState {
                 client: gateway::client(),
+                slow_client: gateway::slow_client(),
                 settings_path,
                 inner: Mutex::new(Inner { gateway, ssh_host, ..Inner::default() }),
                 streams: Mutex::default(),
@@ -795,7 +894,23 @@ fn main() {
                 acp_runs: Mutex::default(),
                 skill_paths: Mutex::default(),
             });
+            #[cfg(target_os = "linux")]
+            if let Some(window) = app.get_webview_window("main") {
+                window.with_webview(|webview| {
+                    use webkit2gtk::{SettingsExt, WebViewExt};
+                    if let Some(settings) = WebViewExt::settings(&webview.inner()) {
+                        settings.set_enable_media_stream(true);
+                    }
+                })?;
+            }
             Ok(())
+        })
+        // Dictation is the only thing that asks; everything else keeps the platform default.
+        // ponytail: the mic is allowed for any origin, fine while the webview loads only bundled
+        // pages; check the requesting origin if it ever shows remote content.
+        .on_permission_request(|_, kind| match kind {
+            PermissionKind::Microphone => PermissionResponse::Allow,
+            _ => PermissionResponse::Default,
         })
         .on_window_event(|window, event| {
             if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
@@ -813,6 +928,10 @@ fn main() {
             finish_pairing,
             configure_ssh,
             connect_ssh,
+            list_profiles,
+            set_profile,
+            list_models,
+            transcribe,
             answer_permission,
             list_sessions,
             session_messages,
@@ -834,4 +953,31 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hermes Desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_profile_keeps_its_own_key() {
+        let mut inner = Inner { creds: Creds { api_key: Some("root".into()), ..Creds::default() }, ..Inner::default() };
+        inner.profile = Some("coder".into());
+        assert_eq!(inner.api_key(), None, "never falls back to the default Profile's key");
+        assert_eq!(inner.replace_key(Some("c".into())), None);
+        assert_eq!(inner.api_key(), Some("c"));
+        inner.profile = Some("default".into());
+        assert_eq!(inner.api_key(), Some("root"));
+        inner.profile = Some("coder".into());
+        assert_eq!(inner.replace_key(None), Some("c".into()), "rollback of a rejected key");
+        assert_eq!(inner.creds.api_key.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn keyring_entries_from_before_profiles_still_load() {
+        let old = r#"{"dashboard_url":"http://h:9119/","api_url":"http://h:8642/","api_key":"k","cookies":{}}"#;
+        let creds: Creds = serde_json::from_str(old).unwrap();
+        assert_eq!(creds.api_key.as_deref(), Some("k"));
+        assert!(creds.profile_keys.is_empty());
+    }
 }
