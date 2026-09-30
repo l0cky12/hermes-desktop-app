@@ -59,7 +59,7 @@ One user message plus the reply shown for it in the chat view.
 _Avoid_: message, exchange
 
 **Run**:
-One server-side execution that produces a reply; a Turn is backed by one Run, or more after Retry.
+One server-side execution that produces a reply; a Turn is backed by one Run, or more after Retry or Regenerate.
 _Avoid_: job, request, completion
 
 **Model choice**:
@@ -89,6 +89,10 @@ _Avoid_: download, share (Hermes has no share links)
 **Retry**:
 Recovering a failed, stopped, or not-sent Turn: reattaching to its Run's event stream where it left off, or starting a new Run with the same input in the same Session when that Run is gone.
 _Avoid_: resend, regenerate
+
+**Regenerate**:
+Starting a new Run with the same input for the latest Turn, once its reply has succeeded; the new reply takes its place, and the earlier replies stay on the Turn to page back to.
+_Avoid_: retry, reroll, redo
 
 **Stop**:
 Closing a Turn's event stream at once and asking the API server to stop its Run.

@@ -32,6 +32,8 @@ interface Turn {
   root: HTMLElement;
   tools: HTMLElement;
   replyEl: HTMLElement;
+  /** Each reply this Turn has had, oldest first, holding its tools and reply; Runs write into the last. */
+  versions: HTMLElement[];
   notice: HTMLElement;
   statusEl: HTMLElement;
   choice: Choice;
@@ -685,6 +687,7 @@ function scrollToEnd() {
 
 function addTurn(text: string, files: Attachment[]): Turn {
   ui!.turns.querySelector(".empty")?.remove();
+  ui!.turns.querySelector(".regenerate")?.remove(); // only the latest reply can be regenerated
   const user = h("div", { className: "user" });
   renderText(user, text);
   if (files.length) user.append(h("div", { className: "files" }, ...files.map((f) => chip(f))));
@@ -697,11 +700,13 @@ function addTurn(text: string, files: Attachment[]): Turn {
     root: h("article", { className: "turn" }),
     tools: h("div", { className: "tools" }),
     replyEl: h("div", { className: "reply" }),
+    versions: [],
     notice: h("p", { className: "notice" }),
     statusEl: h("div", { className: "status" }),
     choice: DEFAULT_CHOICE,
   };
-  turn.root.append(...(text || files.length ? [user] : []), turn.tools, turn.replyEl, turn.notice, turn.statusEl);
+  turn.versions.push(h("div", {}, turn.tools, turn.replyEl));
+  turn.root.append(...(text || files.length ? [user] : []), turn.versions[0], turn.notice, turn.statusEl);
   ui!.turns.append(turn.root);
   turns.push(turn);
   updateComposer();
@@ -735,21 +740,54 @@ function setStatus(turn: Turn, status: TurnStatus, message = "") {
   turn.status = status;
   turn.root.dataset.status = status;
   if (status !== "streaming") turn.notice.textContent = "";
-  if (status === "streaming") turn.statusEl.replaceChildren(h("span", { className: "typing", textContent: "Hermes is working…" }));
-  else if (status === "done") turn.statusEl.replaceChildren();
-  else turn.statusEl.replaceChildren(h("span", { textContent: message }), h("button", { className: "secondary", textContent: "Retry", onclick: () => retry(turn) }));
+  if (status === "streaming") {
+    showVersion(turn, turn.versions.length - 1); // the Run writes into the newest reply
+    turn.statusEl.replaceChildren(h("span", { className: "typing", textContent: "Hermes is working…" }));
+  } else if (status === "done") {
+    const regenerable = runs && turn.root === ui!.turns.lastElementChild && !!(turn.text || turn.files.length);
+    const button = h("button", { className: "link regenerate", textContent: "Regenerate", title: "Run this message again for a new reply", onclick: () => regenerate(turn) });
+    turn.statusEl.replaceChildren(...pager(turn), ...(regenerable ? [button] : []));
+  } else turn.statusEl.replaceChildren(...pager(turn), h("span", { textContent: message }), h("button", { className: "secondary", textContent: "Retry", onclick: () => retry(turn) }));
   if (active === turn && status !== "streaming") active = null;
   updateComposer();
+}
+
+const showVersion = (turn: Turn, i: number) => turn.versions.forEach((v, j) => (v.hidden = j !== i));
+
+/** "‹ 2 / 3 ›" between the replies a Turn has had; it opens on the newest. */
+function pager(turn: Turn): HTMLElement[] {
+  const { versions } = turn;
+  if (versions.length < 2) return [];
+  const count = h("span");
+  const prev = h("button", { className: "link", textContent: "‹", title: "Previous reply", ariaLabel: "Previous reply" });
+  const next = h("button", { className: "link", textContent: "›", title: "Next reply", ariaLabel: "Next reply" });
+  let at = versions.length - 1;
+  const show = (i: number) => {
+    at = i;
+    showVersion(turn, i);
+    count.textContent = `${i + 1} / ${versions.length}`;
+    prev.disabled = i === 0;
+    next.disabled = i === versions.length - 1;
+  };
+  prev.onclick = () => show(at - 1);
+  next.onclick = () => show(at + 1);
+  show(at);
+  return [h("span", {}, prev, count, next)];
+}
+
+/** The Turn runs on the current Model choice and Reasoning level, with a label when they changed. */
+function useChoice(turn: Turn) {
+  turn.choice = choice;
+  const label = changeLabel(lastChoice, choice);
+  lastChoice = choice;
+  if (label) turn.replyEl.after(h("div", { className: "model-label", textContent: label }));
 }
 
 async function send() {
   const text = ui!.input.value.trim();
   if (!text && !pending.length) return;
   const turn = addTurn(text, pending);
-  turn.choice = choice;
-  const label = changeLabel(lastChoice, choice);
-  lastChoice = choice;
-  if (label) turn.replyEl.after(h("div", { className: "model-label", textContent: label }));
+  useChoice(turn);
   pending = [];
   ui!.composerError.textContent = "";
   renderPending();
@@ -818,6 +856,19 @@ async function retry(turn: Turn) {
     }
   }
   // ponytail: a Run that finished and was reaped while we were disconnected is re-run here.
+  await beginRun(turn);
+}
+
+/** Regenerate: a new Run with the Turn's input, into a new reply; the earlier replies stay behind ‹ ›. */
+// ponytail: the API server can't drop a reply, so the Run is appended to the Session, which keeps every reply
+// and shows them to the model; trim the Session before the Turn once Hermes can rewind one over HTTP.
+async function regenerate(turn: Turn) {
+  if (active || !runs) return;
+  turn.tools = h("div", { className: "tools" });
+  turn.replyEl = h("div", { className: "reply" });
+  turn.versions.push(h("div", {}, turn.tools, turn.replyEl));
+  turn.notice.before(turn.versions.at(-1)!);
+  useChoice(turn);
   await beginRun(turn);
 }
 
@@ -922,11 +973,13 @@ async function openSession(id: string): Promise<boolean> {
     const messages = await invoke<Message[]>("session_messages", { id });
     if (sessionId !== id) return false;
     ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "This session has no messages yet." }));
+    let last: Turn | null = null;
     for (const t of transcriptTurns(messages)) {
-      const turn = addTurn(t.user, []);
-      for (const tool of t.tools) addTool(turn, tool, "", "done");
-      if (t.reply) appendReply(turn, t.reply);
+      last = addTurn(t.user, []);
+      for (const tool of t.tools) addTool(last, tool, "", "done");
+      if (t.reply) appendReply(last, t.reply);
     }
+    if (last) setStatus(last, "done"); // offers Regenerate on the latest reply
     return true;
   } catch (e) {
     ui!.turns.replaceChildren(h("p", { className: "error", textContent: `Couldn't load this session: ${asError(e).message}` }));
