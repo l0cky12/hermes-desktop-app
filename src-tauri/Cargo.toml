@@ -18,6 +18,8 @@ keyring = "4"
 base64 = "0.22"
 # `ssh host hermes acp` child process and its JSON-RPC plumbing (acp.rs); same tokio Tauri runs on.
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt"] }
+# Native save dialog for Share and Export as HTML; the file itself is written here in Rust.
+tauri-plugin-dialog = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Dictation needs getUserMedia, which WebKitGTK ships switched off; same crate Tauri already uses.

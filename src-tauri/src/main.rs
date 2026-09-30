@@ -556,6 +556,89 @@ async fn delete_session(state: State<'_, AppState>, id: String) -> Result<(), Er
     Ok(())
 }
 
+const SSH_ARCHIVE: &str = "Over SSH, Hermes archives sessions only in bulk by filter (hermes sessions archive), not one by one";
+
+#[tauri::command]
+async fn rename_session(state: State<'_, AppState>, id: String, title: String) -> Result<(), Error> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(Error::Invalid("A session title can't be empty".into()));
+    }
+    if let Some(host) = state.ssh_host() {
+        let profile = state.lock().profile.clone();
+        return remote::run(&host, remote::sessions_rename(profile.as_deref(), &id, title)).await.map(drop);
+    }
+    let request = state.api(Method::PATCH, &["api", "sessions", &id], &[])?.json(&json!({ "title": title }));
+    send(&state.client, request).await.map(drop)
+}
+
+/// Archived Sessions stay on the API server but drop out of its list.
+#[tauri::command]
+async fn archive_session(state: State<'_, AppState>, id: String, archived: bool) -> Result<(), Error> {
+    if state.ssh() {
+        return Err(Error::Invalid(SSH_ARCHIVE.into()));
+    }
+    let request = state.api(Method::PATCH, &["api", "sessions", &id], &[])?.json(&json!({ "archived": archived }));
+    send(&state.client, request).await.map(drop)
+}
+
+/// The API server never lists archived Sessions; the Dashboard does, per Profile.
+#[tauri::command]
+async fn archived_sessions(state: State<'_, AppState>) -> Result<Value, Error> {
+    if state.ssh() {
+        return Err(Error::Invalid(SSH_ARCHIVE.into()));
+    }
+    let profile = state.lock().profile.clone();
+    let mut query = vec![("archived", "only"), ("order", "recent"), ("limit", "100")];
+    query.extend(profile.as_deref().map(|p| ("profile", p)));
+    let request = state.dashboard(Method::GET, &["api", "sessions"], &query)?;
+    Ok(state.dashboard_json(request).await?["sessions"].take())
+}
+
+/// A new Session holding a copy of the transcript; returns its id. Over HTTP the copy gets
+/// `title` and the API server marks the original as ended ("branched"), though Runs in it keep
+/// working. Over SSH, ACP names the copy itself.
+#[tauri::command]
+async fn duplicate_session(state: State<'_, AppState>, id: String, title: String) -> Result<String, Error> {
+    if state.ssh() {
+        let hermes = state.hermes().await?;
+        let cwd = hermes.cwds.lock().unwrap().get(&id).cloned().unwrap_or_else(|| hermes.home.clone());
+        let forked = hermes.request("session/fork", json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] })).await?;
+        let copy = forked["sessionId"].as_str().filter(|s| !s.is_empty());
+        let copy = copy.ok_or_else(|| Error::NotFound("Hermes has no such session".into()))?.to_owned();
+        hermes.cwds.lock().unwrap().insert(copy.clone(), cwd);
+        hermes.note_model(&copy, &forked);
+        return Ok(copy);
+    }
+    let request = state.api(Method::POST, &["api", "sessions", &id, "fork"], &[])?.json(&json!({ "title": title }));
+    let body = json_body(send(&state.client, request).await?).await?;
+    body["session"]["id"].as_str().map(str::to_owned).ok_or_else(|| Error::Http("Session copied without an id".into()))
+}
+
+/// The Markdown when one was offered and the chosen name isn't `.html`/`.htm`; else the HTML.
+fn export_contents<'a>(path: &Path, html: &'a str, markdown: Option<&'a str>) -> &'a str {
+    let is_html = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
+    markdown.filter(|_| !is_html).unwrap_or(html)
+}
+
+/// Share and Export: the native save dialog, then the file is written here, so the webview
+/// never names a path. `false` = the dialog was cancelled.
+#[tauri::command]
+async fn save_file(app: tauri::AppHandle, name: String, html: String, markdown: Option<String>) -> Result<bool, Error> {
+    use tauri_plugin_dialog::DialogExt;
+    let mut dialog = app.dialog().file().set_file_name(name);
+    if markdown.is_some() {
+        dialog = dialog.add_filter("Markdown", &["md"]);
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dialog.add_filter("HTML", &["html", "htm"]).save_file(move |path| drop(tx.send(path)));
+    let Some(path) = rx.await.ok().flatten() else { return Ok(false) };
+    let path = path.into_path().map_err(|e| Error::Invalid(format!("Can't save there: {e}")))?;
+    std::fs::write(&path, export_contents(&path, &html, markdown.as_deref()))
+        .map_err(|e| Error::Invalid(format!("Could not save {}: {e}", path.display())))?;
+    Ok(true)
+}
+
 #[derive(Serialize)]
 struct RunStarted {
     run_id: String,
@@ -878,6 +961,7 @@ fn clear_client_log() {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let settings_path = app.path().app_config_dir()?.join("settings.json");
             let settings = load_settings(&settings_path);
@@ -936,6 +1020,11 @@ fn main() {
             list_sessions,
             session_messages,
             delete_session,
+            rename_session,
+            archive_session,
+            archived_sessions,
+            duplicate_session,
+            save_file,
             start_run,
             stream_run,
             stop_run,
@@ -971,6 +1060,16 @@ mod tests {
         inner.profile = Some("coder".into());
         assert_eq!(inner.replace_key(None), Some("c".into()), "rollback of a rejected key");
         assert_eq!(inner.creds.api_key.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn share_writes_markdown_unless_an_html_name_was_chosen() {
+        let md = Some("# md");
+        assert_eq!(export_contents(Path::new("/t/a.md"), "<html>", md), "# md");
+        assert_eq!(export_contents(Path::new("/t/a"), "<html>", md), "# md");
+        assert_eq!(export_contents(Path::new("/t/a.HTM"), "<html>", md), "<html>");
+        assert_eq!(export_contents(Path::new("/t/a.html"), "<html>", md), "<html>");
+        assert_eq!(export_contents(Path::new("/t/a.md"), "<html>", None), "<html>", "Export as HTML offers no Markdown");
     }
 
     #[test]

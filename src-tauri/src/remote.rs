@@ -140,6 +140,13 @@ pub fn kanban_dispatch(dry_run: bool) -> Cmd {
     hermes("hermes kanban dispatch", &args)
 }
 
+/// `hermes [-p P] sessions rename -- <id> <title>`: the title stays one argument, so its spacing survives.
+pub fn sessions_rename(profile: Option<&str>, id: &str, title: &str) -> Cmd {
+    let profile = profile.map(|p| format!("-p {} ", quote(p))).unwrap_or_default();
+    let script = format!("exec hermes {profile}sessions rename -- {} {}", quote(id), quote(title));
+    Cmd { summary: "hermes sessions rename", script, stdin: None }
+}
+
 /// The active Profile's home: `hermes config path` names its config.yaml (last line, past any chatter).
 const PROFILE_HOME: &str = "home=$(hermes config path | tail -n 1) && home=${home%/*} || exit 1";
 
@@ -212,6 +219,15 @@ mod tests {
         let cmd = kanban_comment("-t_1", "$(rm -rf ~) it's");
         assert_eq!(argv_seen_by_hermes(&cmd), ["kanban", "comment", "--", "-t_1", "$(rm -rf ~) it's"]);
         assert_eq!(cmd.summary, "hermes kanban comment");
+    }
+
+    #[test]
+    fn renaming_passes_the_profile_then_id_and_title_as_positionals() {
+        for title in NASTY {
+            let cmd = sessions_rename(Some("coder"), "-s_1", title);
+            assert_eq!(argv_seen_by_hermes(&cmd), ["-p", "coder", "sessions", "rename", "--", "-s_1", title]);
+        }
+        assert_eq!(argv_seen_by_hermes(&sessions_rename(None, "s", "a  b")), ["sessions", "rename", "--", "s", "a  b"]);
     }
 
     #[test]

@@ -125,6 +125,12 @@ serve(DASH_PORT, "dashboard", async (req, res, url) => {
   if (route === "GET /api/profiles") {
     return send(res, 200, { profiles: PROFILES.map((name) => ({ name, is_default: name === "default" })) });
   }
+  if (route === "GET /api/sessions" && url.searchParams.get("archived") === "only") {
+    // The Dashboard's per-Profile list (web_routers/sessions.py); only archived=only is mocked.
+    const name = url.searchParams.get("profile") ?? "default";
+    const rows = Object.values(state.sessions).filter((s) => (s.profile ?? "default") === name && s.archived);
+    return send(res, 200, { sessions: rows.sort((x, y) => y.last_active - x.last_active), total: rows.length });
+  }
   if (route === "GET /api/profiles/active") return send(res, 200, { active: "orchestrator", current: "default" });
   if (route === "POST /api/audio/transcribe") {
     const body = await readJson(req);
@@ -413,7 +419,7 @@ serve(API_PORT, "api", async (req, res, url) => {
   }
   if (route === "GET /api/sessions") {
     const limit = Math.min(Number(url.searchParams.get("limit") ?? 50), 200);
-    const all = Object.values(state.sessions).filter((s) => (s.profile ?? "default") === profile).sort((x, y) => y.last_active - x.last_active);
+    const all = Object.values(state.sessions).filter((s) => (s.profile ?? "default") === profile && !s.archived).sort((x, y) => y.last_active - x.last_active);
     return send(res, 200, { object: "list", data: all.slice(0, limit), limit, offset: 0, has_more: all.length > limit });
   }
   if (route === "POST /api/sessions") {
@@ -432,6 +438,10 @@ serve(API_PORT, "api", async (req, res, url) => {
     if (route === "PATCH /api/sessions/:id") {
       const body = (await readJson(req)) ?? {};
       if ("title" in body) session.title = body.title;
+      if ("archived" in body) {
+        if (typeof body.archived !== "boolean") return send(res, 400, { error: { message: "archived must be a boolean", code: "invalid_flag" } });
+        session.archived = body.archived;
+      }
       save();
       return send(res, 200, { object: "hermes.session", session });
     }
@@ -440,6 +450,18 @@ serve(API_PORT, "api", async (req, res, url) => {
       delete state.messages[id];
       save();
       return send(res, 200, { object: "hermes.session.deleted", id, deleted: true });
+    }
+    if (route === "POST /api/sessions/:id/fork") {
+      // Like the API server: the copy gets every message and "<title> fork"; the original ends as "branched".
+      const body = (await readJson(req)) ?? {};
+      const fork = touchSession(newId("sess_"), session.preview, session.profile);
+      fork.title = body.title ?? `${session.title || "fork"} fork`;
+      fork.parent_session_id = id;
+      state.messages[fork.id] = structuredClone(state.messages[id]);
+      session.ended_at = now();
+      session.end_reason = "branched";
+      save();
+      return send(res, 201, { object: "hermes.session", session: fork });
     }
     if (route === "GET /api/sessions/:id/messages") {
       const data = state.messages[id];
