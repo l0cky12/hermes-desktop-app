@@ -153,13 +153,18 @@ serve(DASH_PORT, "dashboard", async (req, res, url) => {
 // In memory only; "MOCK_KANBAN=off" answers 404 like a disabled Kanban plugin.
 const task = (id, status, title, extra = {}) =>
   ({ id, title, body: `Body of ${title}.`, assignee: null, status, priority: 0, tenant: null, created_at: Math.floor(now()) - 3600, ...extra });
-const board = [
-  task("t_2c64562e", "todo", "Register cerberus in orchestrator SOUL.md roster", { assignee: "daedalus", priority: 5 }),
-  task("t_91bc558f", "ready", "Dotfiles: center Wi-Fi share QR code", { assignee: "backend-developer" }),
-  task("t_922275a1", "blocked", "Build and validate cerberus specialist profile", { assignee: "hephaestus", priority: 10, tenant: "homelab" }),
-  task("t_53d2c4f2", "done", "Review Phase 2 Terraform architecture", { assignee: "code-reviewer", priority: 90 }),
-  task("t_0ld0ld00", "archived", "An archived task"),
-];
+const boards = {
+  default: { name: "Default", tasks: [
+    task("t_2c64562e", "todo", "Register cerberus in orchestrator SOUL.md roster", { assignee: "daedalus", priority: 5 }),
+    task("t_91bc558f", "ready", "Dotfiles: center Wi-Fi share QR code", { assignee: "backend-developer" }),
+    task("t_922275a1", "blocked", "Build and validate cerberus specialist profile", { assignee: "hephaestus", priority: 10, tenant: "homelab" }),
+    task("t_53d2c4f2", "done", "Review Phase 2 Terraform architecture", { assignee: "code-reviewer", priority: 90 }),
+    task("t_0ld0ld00", "archived", "An archived task"),
+  ] },
+  ops: { name: "Ops", tasks: [task("t_0f5e1a2b", "ready", "Rotate the backup keys", { assignee: "forge" })] },
+};
+// The host's current Board; like Hermes, `board` on a request picks another without changing it.
+const CURRENT_BOARD = "default";
 const comments = { t_922275a1: [{ id: 1, task_id: "t_922275a1", author: "dashboard", body: "Waiting on the profile build.", created_at: Math.floor(now()) - 600 }] };
 const skills = [
   { name: "unslop", description: "Cut AI tells from any writing.", category: null },
@@ -178,7 +183,14 @@ async function work(req, res, url) {
   if (path.startsWith("kanban") && env.MOCK_KANBAN === "off") return send(res, 404, { detail: "Not Found" });
   const off = disabled[url.searchParams.get("profile") ?? "default"];
   if (path.startsWith("/api/skills") && !off) return send(res, 404, { detail: "Profile does not exist." });
+  const slug = url.searchParams.get("board") || CURRENT_BOARD;
+  if (path.startsWith("kanban") && !boards[slug]) return send(res, 404, { detail: `board '${slug}' does not exist` });
+  const board = boards[slug]?.tasks;
   switch (route) {
+    case "GET kanban/boards": {
+      const list = Object.entries(boards).map(([s, b]) => ({ slug: s, name: b.name, is_current: s === CURRENT_BOARD, total: b.tasks.length }));
+      return send(res, 200, { boards: list, current: CURRENT_BOARD });
+    }
     case "GET kanban/board": {
       const archived = url.searchParams.get("include_archived") === "true";
       const names = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", ...(archived ? ["archived"] : [])];

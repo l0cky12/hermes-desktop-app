@@ -118,19 +118,33 @@ pub fn sessions_pinned(profile: Option<&str>) -> Cmd {
     hermes_as(profile, "hermes sessions pinned", &["--json".into()])
 }
 
-pub fn kanban_list() -> Cmd {
-    hermes("hermes kanban list", &["--archived".into(), "--json".into()])
+/// `hermes kanban <sub> <args>` on `board` (`None`: the host's current Board). Hermes reads
+/// `--board` only before the kanban subcommand, so it can't go with the other args.
+fn kanban(summary: &'static str, board: Option<&str>, args: &[String]) -> Cmd {
+    let sub = summary.strip_prefix("hermes kanban ").expect("summary names a hermes kanban subcommand");
+    let board = board.map(|b| format!("{} ", quote(&format!("--board={b}")))).unwrap_or_default();
+    let args: Vec<String> = args.iter().map(|a| quote(a)).collect();
+    Cmd { summary, script: format!("exec hermes kanban {board}{sub} {}", args.join(" ")), stdin: None }
 }
 
-pub fn kanban_assignees() -> Cmd {
-    hermes("hermes kanban assignees", &["--json".into()])
+/// The host's Boards, archived ones left out as the Dashboard does.
+pub fn kanban_boards() -> Cmd {
+    hermes("hermes kanban boards list", &["--json".into()])
 }
 
-pub fn kanban_show(id: &str) -> Cmd {
-    hermes("hermes kanban show", &["--json".into(), "--".into(), id.into()])
+pub fn kanban_list(board: Option<&str>) -> Cmd {
+    kanban("hermes kanban list", board, &["--archived".into(), "--json".into()])
 }
 
-pub fn kanban_create(new: &NewTask) -> Cmd {
+pub fn kanban_assignees(board: Option<&str>) -> Cmd {
+    kanban("hermes kanban assignees", board, &["--json".into()])
+}
+
+pub fn kanban_show(board: Option<&str>, id: &str) -> Cmd {
+    kanban("hermes kanban show", board, &["--json".into(), "--".into(), id.into()])
+}
+
+pub fn kanban_create(board: Option<&str>, new: &NewTask) -> Cmd {
     let mut args = vec!["--json".to_owned()];
     let body = new.body.clone().filter(|b| !b.is_empty());
     if body.is_some() {
@@ -141,22 +155,22 @@ pub fn kanban_create(new: &NewTask) -> Cmd {
     args.extend(new.priority.map(|p| format!("--priority={p}")));
     args.extend(set("tenant", &new.tenant));
     args.extend(["--".into(), new.title.clone()]);
-    Cmd { stdin: body, ..hermes("hermes kanban create", &args) }
+    Cmd { stdin: body, ..kanban("hermes kanban create", board, &args) }
 }
 
-pub fn kanban_comment(id: &str, text: &str) -> Cmd {
-    hermes("hermes kanban comment", &["--".into(), id.into(), text.into()])
+pub fn kanban_comment(board: Option<&str>, id: &str, text: &str) -> Cmd {
+    kanban("hermes kanban comment", board, &["--".into(), id.into(), text.into()])
 }
 
 /// Spawns per Dispatch: Hermes's own default, so one click can't flood the host.
 pub const DISPATCH_MAX: &str = "8";
 
-pub fn kanban_dispatch(dry_run: bool) -> Cmd {
+pub fn kanban_dispatch(board: Option<&str>, dry_run: bool) -> Cmd {
     let mut args = vec!["--max".to_owned(), DISPATCH_MAX.into(), "--json".into()];
     if dry_run {
         args.push("--dry-run".into());
     }
-    hermes("hermes kanban dispatch", &args)
+    kanban("hermes kanban dispatch", board, &args)
 }
 
 /// The Profile's home: `hermes config path` names its config.yaml (last line, past any chatter).
@@ -226,10 +240,10 @@ mod tests {
     fn new_task_title_is_one_positional_and_the_body_goes_on_stdin() {
         for title in NASTY {
             let new = NewTask { title: title.into(), body: Some("line 1\n\n- line 3".into()), assignee: Some("-x".into()), priority: Some(5), tenant: None };
-            let cmd = kanban_create(&new);
+            let cmd = kanban_create(Some("ops"), &new);
             assert_eq!(
                 argv_seen_by_hermes(&cmd),
-                ["kanban", "create", "--json", "--body-file", "-", "--assignee=-x", "--priority=5", "--", title]
+                ["kanban", "--board=ops", "create", "--json", "--body-file", "-", "--assignee=-x", "--priority=5", "--", title]
             );
             assert_eq!(cmd.stdin.as_deref(), Some("line 1\n\n- line 3"));
             assert_eq!(cmd.summary, "hermes kanban create");
@@ -238,7 +252,7 @@ mod tests {
 
     #[test]
     fn comment_text_and_task_id_follow_the_end_of_options_marker() {
-        let cmd = kanban_comment("-t_1", "$(rm -rf ~) it's");
+        let cmd = kanban_comment(None, "-t_1", "$(rm -rf ~) it's");
         assert_eq!(argv_seen_by_hermes(&cmd), ["kanban", "comment", "--", "-t_1", "$(rm -rf ~) it's"]);
         assert_eq!(cmd.summary, "hermes kanban comment");
     }
@@ -260,6 +274,17 @@ mod tests {
     }
 
     #[test]
+    fn the_board_goes_before_the_kanban_subcommand() {
+        assert_eq!(argv_seen_by_hermes(&kanban_list(Some("ops"))), ["kanban", "--board=ops", "list", "--archived", "--json"]);
+        assert_eq!(argv_seen_by_hermes(&kanban_list(None)), ["kanban", "list", "--archived", "--json"]);
+        assert_eq!(argv_seen_by_hermes(&kanban_show(Some("it's"), "t_1")), ["kanban", "--board=it's", "show", "--json", "--", "t_1"]);
+        assert_eq!(argv_seen_by_hermes(&kanban_dispatch(Some("ops"), true)), ["kanban", "--board=ops", "dispatch", "--max", "8", "--json", "--dry-run"]);
+        assert_eq!(argv_seen_by_hermes(&kanban_assignees(Some("ops"))), ["kanban", "--board=ops", "assignees", "--json"]);
+        assert_eq!(argv_seen_by_hermes(&kanban_boards()), ["kanban", "boards", "list", "--json"]);
+        assert_eq!(kanban_list(Some("ops")).summary, "hermes kanban list");
+    }
+
+    #[test]
     fn disabling_skills_writes_them_as_one_json_list() {
         let cmd = skills_set_disabled(None, &["a'b".to_owned(), "c d".to_owned()]);
         assert_eq!(argv_seen_by_hermes(&cmd), ["config", "set", "skills.disabled", r#"["a'b","c d"]"#]);
@@ -270,7 +295,7 @@ mod tests {
         let cmd = skills_set_disabled(Some("coder"), &["a".to_owned()]);
         assert_eq!(argv_seen_by_hermes(&cmd), ["-p", "coder", "config", "set", "skills.disabled", r#"["a"]"#]);
         assert_eq!(argv_seen_by_hermes(&skills_disabled(Some("coder"))), ["-p", "coder", "config", "get", "skills.disabled", "--json"]);
-        assert_eq!(argv_seen_by_hermes(&kanban_assignees()), ["kanban", "assignees", "--json"]);
+        assert_eq!(argv_seen_by_hermes(&kanban_assignees(None)), ["kanban", "assignees", "--json"]);
     }
 
     #[test]
@@ -315,11 +340,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn reads_board_and_skills_from_real_hermes() {
-        let tasks = crate::work::board_from_cli(json(&run("localhost", kanban_list()).await.unwrap()).unwrap());
+        let tasks = crate::work::board_from_cli(json(&run("localhost", kanban_list(None)).await.unwrap()).unwrap());
         let first = tasks.first().expect("at least one task");
-        let detail = crate::work::detail_from(json(&run("localhost", kanban_show(&first.id)).await.unwrap()).unwrap()).unwrap();
+        let detail = crate::work::detail_from(json(&run("localhost", kanban_show(None, &first.id)).await.unwrap()).unwrap()).unwrap();
         assert_eq!(detail.task.id, first.id);
-        assert!(!crate::work::assignee_names(json(&run("localhost", kanban_assignees()).await.unwrap()).unwrap()).is_empty());
+        assert!(!crate::work::assignee_names(json(&run("localhost", kanban_assignees(None)).await.unwrap()).unwrap()).is_empty());
         let (skills, paths) = crate::work::skills_from_ssh(&run("localhost", skills_list(None)).await.unwrap()).unwrap();
         let skill = skills.iter().find(|s| !s.description.is_empty()).expect("a skill with a description");
         assert!(run("localhost", skill_content(&paths[&skill.name])).await.unwrap().contains(&skill.name));

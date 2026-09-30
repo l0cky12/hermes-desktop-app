@@ -78,6 +78,32 @@ pub fn assignee_names(body: Value) -> Vec<String> {
     list.iter().filter_map(|a| a["name"].as_str().or(a.as_str()).map(Into::into)).collect()
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct Board {
+    pub slug: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// The host's Boards and which one is its current Board (what Hermes uses when none is named).
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Boards {
+    pub boards: Vec<Board>,
+    pub current: Option<String>,
+}
+
+/// `hermes kanban boards list --json` is a list marking `is_current`; the Dashboard's
+/// `GET /boards` wraps it in `boards` beside `current`.
+pub fn boards_from(body: Value) -> Boards {
+    let list = if body.is_array() { &body } else { &body["boards"] };
+    let list = list.as_array().map(Vec::as_slice).unwrap_or_default();
+    let marked = list.iter().find(|b| b["is_current"] == true).and_then(|b| b["slug"].as_str());
+    Boards {
+        boards: list.iter().filter_map(|b| serde_json::from_value(b.clone()).ok()).collect(),
+        current: body["current"].as_str().or(marked).map(Into::into),
+    }
+}
+
 #[derive(Serialize, Debug, PartialEq)]
 pub struct Skill {
     pub name: String,
@@ -240,6 +266,15 @@ mod tests {
         let cli = json!([{ "name": "aegis", "on_disk": true, "counts": {} }, { "name": "forge", "on_disk": false }]);
         assert_eq!(assignee_names(cli), ["aegis", "forge"]);
         assert_eq!(assignee_names(json!({ "assignees": [{ "name": "aegis" }, "forge"] })), ["aegis", "forge"]);
+    }
+
+    #[test]
+    fn boards_and_the_current_one_from_either_transport() {
+        let board = |slug: &str, name: &str| Board { slug: slug.into(), name: name.into() };
+        let cli = json!([{ "slug": "default", "name": "Default", "is_current": false }, { "slug": "ops", "name": "Ops", "is_current": true, "counts": {} }]);
+        assert_eq!(boards_from(cli), Boards { boards: vec![board("default", "Default"), board("ops", "Ops")], current: Some("ops".into()) });
+        let dashboard = json!({ "boards": [{ "slug": "default", "name": "Default", "is_current": true, "total": 3 }, { "slug": "x" }], "current": "default" });
+        assert_eq!(boards_from(dashboard), Boards { boards: vec![board("default", "Default"), board("x", "")], current: Some("default".into()) });
     }
 
     #[test]

@@ -53,11 +53,22 @@ export function changeLabel(previous: Choice | undefined, current: Choice): stri
   return `${current.model?.model ?? "Profile default"} · ${current.reasoning ?? "default reasoning"}`;
 }
 
-/** Last Profile used on this connection, else the Gateway's default Profile, else `default`, else the first listed. */
-export function startProfile(store: Store, connection: string, names: string[], gatewayDefault: string | null): string {
-  const saved = String(read(store, `profile:${connection}`));
-  return [saved, gatewayDefault ?? "", "default"].find((n) => names.includes(n)) ?? names[0] ?? "default";
+/** The saved name if `names` still has it, else `fallback`, else `default`, else the first listed. */
+function start(store: Store, key: string, names: string[], fallback: string | null): string {
+  const saved = String(read(store, key));
+  return [saved, fallback ?? "", "default"].find((n) => names.includes(n)) ?? names[0] ?? "default";
 }
+
+/** Last Profile used on this connection, else the Gateway's default Profile. */
+export const startProfile = (store: Store, connection: string, names: string[], gatewayDefault: string | null) =>
+  start(store, `profile:${connection}`, names, gatewayDefault);
 
 export const saveProfile = (store: Store, connection: string, name: string) =>
   store.setItem(`profile:${connection}`, JSON.stringify(name));
+
+/** Last Board chosen on this connection, else the host's current Board. */
+export const startBoard = (store: Store, connection: string, slugs: string[], current: string | null) =>
+  start(store, `board:${connection}`, slugs, current);
+
+export const saveBoard = (store: Store, connection: string, slug: string) =>
+  store.setItem(`board:${connection}`, JSON.stringify(slug));

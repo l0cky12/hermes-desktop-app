@@ -164,8 +164,11 @@ impl AppState {
         json_body(response).await
     }
 
-    fn kanban(&self, method: Method, path: &[&str], query: &[(&str, &str)]) -> Result<RequestBuilder, Error> {
-        self.dashboard(method, &[&["api", "plugins", "kanban"], path].concat(), query)
+    /// A Kanban plugin request on `board` (`None`: the host's current Board). The Board goes in
+    /// each request: changing the host's own current Board would change it for everyone.
+    fn kanban(&self, method: Method, path: &[&str], query: &[(&str, &str)], board: Option<&str>) -> Result<RequestBuilder, Error> {
+        let query = [query, board.map(|b| ("board", b)).as_slice()].concat();
+        self.dashboard(method, &[&["api", "plugins", "kanban"], path].concat(), &query)
     }
 
     /// Skills routes act on the current Profile (`?profile=`); none yet means the Dashboard's own.
@@ -884,55 +887,70 @@ async fn stop_run(state: State<'_, AppState>, run_id: String) -> Result<(), Erro
 // ---- Board and Skills: Dashboard routes, or `ssh host hermes …` (ADR 0002) ----
 
 #[tauri::command]
-async fn kanban_board(state: State<'_, AppState>) -> Result<Vec<work::Task>, Error> {
+async fn kanban_boards(state: State<'_, AppState>) -> Result<work::Boards, Error> {
+    let body = match state.ssh_host() {
+        Some(host) => remote::json(&remote::run(&host, remote::kanban_boards()).await?)?,
+        None => state.dashboard_json(state.kanban(Method::GET, &["boards"], &[], None)?).await?,
+    };
+    Ok(work::boards_from(body))
+}
+
+#[tauri::command]
+async fn kanban_board(state: State<'_, AppState>, board: Option<String>) -> Result<Vec<work::Task>, Error> {
+    let board = board.as_deref();
     if let Some(host) = state.ssh_host() {
-        return Ok(work::board_from_cli(remote::json(&remote::run(&host, remote::kanban_list()).await?)?));
+        return Ok(work::board_from_cli(remote::json(&remote::run(&host, remote::kanban_list(board)).await?)?));
     }
-    let request = state.kanban(Method::GET, &["board"], &[("include_archived", "true")])?;
+    let request = state.kanban(Method::GET, &["board"], &[("include_archived", "true")], board)?;
     match state.dashboard_json(request).await {
-        Err(Error::NotFound(_)) => Err(Error::NotFound("The Kanban plugin is disabled on this Hermes".into())),
+        // A named Board's 404 is Hermes saying that Board is gone; keep its message.
+        Err(Error::NotFound(_)) if board.is_none() => Err(Error::NotFound("The Kanban plugin is disabled on this Hermes".into())),
         body => Ok(work::board_from_dashboard(body?)),
     }
 }
 
 #[tauri::command]
-async fn kanban_assignees(state: State<'_, AppState>) -> Result<Vec<String>, Error> {
+async fn kanban_assignees(state: State<'_, AppState>, board: Option<String>) -> Result<Vec<String>, Error> {
+    let board = board.as_deref();
     let body = match state.ssh_host() {
-        Some(host) => remote::json(&remote::run(&host, remote::kanban_assignees()).await?)?,
-        None => state.dashboard_json(state.kanban(Method::GET, &["assignees"], &[])?).await?,
+        Some(host) => remote::json(&remote::run(&host, remote::kanban_assignees(board)).await?)?,
+        None => state.dashboard_json(state.kanban(Method::GET, &["assignees"], &[], board)?).await?,
     };
     Ok(work::assignee_names(body))
 }
 
 #[tauri::command]
-async fn kanban_task(state: State<'_, AppState>, id: String) -> Result<work::Detail, Error> {
+async fn kanban_task(state: State<'_, AppState>, board: Option<String>, id: String) -> Result<work::Detail, Error> {
+    let board = board.as_deref();
     let body = match state.ssh_host() {
-        Some(host) => remote::json(&remote::run(&host, remote::kanban_show(&id)).await?)?,
-        None => state.dashboard_json(state.kanban(Method::GET, &["tasks", &id], &[])?).await?,
+        Some(host) => remote::json(&remote::run(&host, remote::kanban_show(board, &id)).await?)?,
+        None => state.dashboard_json(state.kanban(Method::GET, &["tasks", &id], &[], board)?).await?,
     };
     work::detail_from(body).map_err(|e| Error::Http(format!("Unreadable task: {e}")))
 }
 
 #[tauri::command]
-async fn kanban_create(state: State<'_, AppState>, task: work::NewTask) -> Result<(), Error> {
+async fn kanban_create(state: State<'_, AppState>, board: Option<String>, task: work::NewTask) -> Result<(), Error> {
     if task.title.trim().is_empty() {
         return Err(Error::Invalid("A task needs a title".into()));
     }
+    let board = board.as_deref();
     match state.ssh_host() {
-        Some(host) => remote::run(&host, remote::kanban_create(&task)).await.map(drop),
-        None => state.dashboard_json(state.kanban(Method::POST, &["tasks"], &[])?.json(&task)).await.map(drop),
+        Some(host) => remote::run(&host, remote::kanban_create(board, &task)).await.map(drop),
+        None => state.dashboard_json(state.kanban(Method::POST, &["tasks"], &[], board)?.json(&task)).await.map(drop),
     }
 }
 
 #[tauri::command]
-async fn kanban_comment(state: State<'_, AppState>, id: String, text: String) -> Result<(), Error> {
+async fn kanban_comment(state: State<'_, AppState>, board: Option<String>, id: String, text: String) -> Result<(), Error> {
     if text.trim().is_empty() {
         return Err(Error::Invalid("A comment can't be empty".into()));
     }
+    let board = board.as_deref();
     match state.ssh_host() {
-        Some(host) => remote::run(&host, remote::kanban_comment(&id, &text)).await.map(drop),
+        Some(host) => remote::run(&host, remote::kanban_comment(board, &id, &text)).await.map(drop),
         None => {
-            let request = state.kanban(Method::POST, &["tasks", &id, "comments"], &[])?.json(&json!({ "body": text }));
+            let request = state.kanban(Method::POST, &["tasks", &id, "comments"], &[], board)?.json(&json!({ "body": text }));
             state.dashboard_json(request).await.map(drop)
         }
     }
@@ -940,12 +958,13 @@ async fn kanban_comment(state: State<'_, AppState>, id: String, text: String) ->
 
 /// One Dispatch pass (or a preview of one), capped at Hermes's default of 8 spawns.
 #[tauri::command]
-async fn kanban_dispatch(state: State<'_, AppState>, dry_run: bool) -> Result<Value, Error> {
+async fn kanban_dispatch(state: State<'_, AppState>, board: Option<String>, dry_run: bool) -> Result<Value, Error> {
+    let board = board.as_deref();
     if let Some(host) = state.ssh_host() {
-        return remote::json(&remote::run(&host, remote::kanban_dispatch(dry_run)).await?);
+        return remote::json(&remote::run(&host, remote::kanban_dispatch(board, dry_run)).await?);
     }
     let query = [("dry_run", if dry_run { "true" } else { "false" }), ("max", remote::DISPATCH_MAX)];
-    state.dashboard_json(state.kanban(Method::POST, &["dispatch"], &query)?).await
+    state.dashboard_json(state.kanban(Method::POST, &["dispatch"], &query, board)?).await
 }
 
 #[tauri::command]
@@ -1106,6 +1125,7 @@ fn main() {
             start_run,
             stream_run,
             stop_run,
+            kanban_boards,
             kanban_board,
             kanban_assignees,
             kanban_task,
@@ -1192,6 +1212,26 @@ mod tests {
         assert_eq!(export_contents(Path::new("/t/a.HTM"), "<html>", md), "<html>");
         assert_eq!(export_contents(Path::new("/t/a.html"), "<html>", md), "<html>");
         assert_eq!(export_contents(Path::new("/t/a.md"), "<html>", None), "<html>", "Export as HTML offers no Markdown");
+    }
+
+    #[test]
+    fn kanban_requests_name_the_chosen_board() {
+        let gateway = Gateway { dashboard: parse_origin("http://h:9119").unwrap(), api: parse_origin("http://h:8642").unwrap() };
+        let state = AppState {
+            client: reqwest::Client::new(),
+            slow_client: reqwest::Client::new(),
+            settings_path: PathBuf::new(),
+            inner: Mutex::new(Inner { gateway: Some(gateway), ..Inner::default() }),
+            streams: Mutex::default(),
+            dropped: Mutex::default(),
+            hermes: tokio::sync::Mutex::default(),
+            acp_runs: Mutex::default(),
+            skill_paths: Mutex::default(),
+        };
+        let url = |path: &[&str], query: &[(&str, &str)], board| state.kanban(Method::POST, path, query, board).unwrap().build().unwrap().url().to_string();
+        assert_eq!(url(&["dispatch"], &[("dry_run", "true")], Some("ops")), "http://h:9119/api/plugins/kanban/dispatch?dry_run=true&board=ops");
+        assert_eq!(url(&["tasks", "t_1"], &[], Some("a b")), "http://h:9119/api/plugins/kanban/tasks/t_1?board=a+b");
+        assert_eq!(url(&["board"], &[], None), "http://h:9119/api/plugins/kanban/board");
     }
 
     #[test]
