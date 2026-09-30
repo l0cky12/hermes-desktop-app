@@ -301,6 +301,12 @@ pub fn mcp_test_from_cli(out: &str) -> McpTest {
     if let Some(why) = out.lines().find_map(|l| l.trim().strip_prefix("✗ ")) {
         return McpTest { ok: false, error: Some(why.into()), tools: Vec::new(), prompts: None, resources: None };
     }
+    if !out.contains("Tools discovered:") {
+        // Not a connection failure but not a result either: hermes exited early (config error,
+        // broken launcher). Its reason went to stderr; the last stdout line is the best hint.
+        let last = out.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("hermes mcp test printed no result");
+        return McpTest { ok: false, error: Some(last.into()), tools: Vec::new(), prompts: None, resources: None };
+    }
     let tools = out
         .lines()
         .skip_while(|l| !l.contains("Tools discovered:"))
@@ -517,6 +523,9 @@ mod tests {
             McpTool { name: "bare".into(), description: None },
         ]);
         assert!(mcp_test_from_cli("  ✓ Connected (3ms)\n  ✓ Tools discovered: 0\n\n").tools.is_empty());
+        // No result at all (hermes died before testing) is a failure, never "Connected, 0 tools".
+        assert!(!mcp_test_from_cli("").ok);
+        assert_eq!(mcp_test_from_cli("  Testing 'x'...\n").error.as_deref(), Some("Testing 'x'..."));
     }
 
     #[test]
