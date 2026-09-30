@@ -1385,7 +1385,14 @@ function skillsView(): View {
 
   function renderHeader() {
     const skill = skills.find((s) => s.name === chosen);
-    if (!skill) return;
+    if (!skill) {
+      // The chosen Skill is gone from the fresh list (uninstalled on the host).
+      if (chosen !== null) {
+        chosen = null;
+        detail.replaceChildren(placeholder);
+      }
+      return;
+    }
     header.replaceChildren(toggle(skill, detailError), h("h2", { textContent: skill.name }),
       h("span", { className: "muted", textContent: `${skill.category ?? "general"}${skill.essential ? " · essential" : ""}` }));
   }
@@ -1412,29 +1419,31 @@ function skillsView(): View {
     if (wanted !== key) {
       key = wanted;
       chosen = null;
+      error.textContent = "";
       detail.replaceChildren(placeholder);
     }
     skills = skillsCache.get(key) ?? [];
     if (skillsCache.has(key)) render();
     else list.replaceChildren(h("p", { className: "empty", textContent: "Loading skills…" }));
-    void refresh(key);
+    void refresh();
   }
 
-  async function refresh(forKey: string) {
+  // `key` only changes in show(), which always starts a new refresh, so a ticket that is still
+  // current is always for the current key.
+  async function refresh() {
     const seen = settled;
     const ticket = ++refreshes;
     try {
       const fresh = await call<Skill[]>("skills_list");
       if (ticket !== refreshes) return;
-      if (forKey === key) error.textContent = "";
-      if ((settled !== seen || pending) && skillsCache.has(forKey)) return;
+      error.textContent = "";
+      if ((settled !== seen || pending) && skillsCache.has(key)) return;
       // Unchanged: keep the shown rows (and the objects their switches update) rather than redraw.
-      const same = JSON.stringify(skillsCache.get(forKey)) === JSON.stringify(fresh);
-      if (!same) skillsCache.set(forKey, fresh);
-      if (forKey !== key || same) return;
+      if (JSON.stringify(skillsCache.get(key)) === JSON.stringify(fresh)) return;
+      skillsCache.set(key, fresh);
       skills = fresh;
     } catch (e) {
-      if (ticket !== refreshes || forKey !== key) return;
+      if (ticket !== refreshes) return;
       error.textContent = `Couldn't load skills: ${asError(e).message}`;
     }
     render();
