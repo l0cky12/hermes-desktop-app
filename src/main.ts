@@ -6,6 +6,7 @@ import {
   changeLabel, choiceKey, DEFAULT_CHOICE, loadChoice, REASONING_LEVELS, saveChoice, saveProfile, startProfile,
   type Choice, type ModelChoice,
 } from "./prefs";
+import { addUsage, describeCost, describeUsage, runUsage, sessionUsage, type SessionTotals, type Usage } from "./usage";
 
 type GatewayError = { kind: "unreachable" | "unauthorized" | "not_found" | "http" | "invalid"; message: string };
 type Init = { dashboard_url: string | null; api_url: string | null; ssh_host: string | null; keyring: boolean };
@@ -13,7 +14,7 @@ type Status = { auth_required: boolean; auth_providers: string[] };
 type RunStarted = { run_id: string; session_id: string };
 type RunEvent = { event: string; seq?: number; [field: string]: unknown };
 type StreamMsg = { type: "event"; data: RunEvent } | { type: "dropped"; message: string };
-type Session = { id: string; title?: string | null; preview?: string | null };
+type Session = { id: string; title?: string | null; preview?: string | null } & SessionTotals;
 type Message = { role: string; content: unknown; tool_calls?: { function?: { name?: string } }[] | null };
 type Attachment = { path: string } | { name: string; data_url: string };
 type Models = { default: ModelChoice | null; groups: { provider: string; name: string; models: string[] }[] };
@@ -327,10 +328,13 @@ let pending: Attachment[] = [];
 let models: Models = { default: null, groups: [] };
 let choice: Choice = DEFAULT_CHOICE; // what the next Turn in this view runs on
 let lastChoice: Choice | undefined; // what the previous Turn ran on, for the reply label
+let sessions: Session[] = [];
+let sshUsage: Usage | null = null; // over SSH, the sum of this view's Turns: Hermes reports no stored totals there
 let ui: {
   sessions: HTMLUListElement;
   sessionsError: HTMLElement;
   turns: HTMLElement;
+  sessionUsage: HTMLElement;
   pending: HTMLElement;
   input: HTMLTextAreaElement;
   send: HTMLButtonElement;
@@ -356,6 +360,7 @@ function showChat(supported: boolean, ssh = false) {
     sessions: h("ul", { className: "sessions" }),
     sessionsError: h("p", { className: "error" }),
     turns: h("div", { className: "turns" }),
+    sessionUsage: h("p", { className: "session-usage", hidden: true }),
     pending: h("div", { className: "pending" }),
     input: h("textarea", { placeholder: runs ? "Message Hermes. Drop, paste, or pick attachments." : unavailable, rows: 3 }),
     send: h("button", { textContent: "Send" }),
@@ -412,7 +417,7 @@ function showChat(supported: boolean, ssh = false) {
       h("aside", {}, h("div", { className: "row" }, h("h2", { textContent: "Sessions" }),
         h("button", { className: "secondary", textContent: "New chat", onclick: newChat })), ui.sessionsError, ui.sessions,
         h("footer", {}, h("button", { className: "icon-btn", title: "Settings", onclick: showSettings }, icon("settings"), "Settings"))),
-      h("main", {}, ui.turns, ui.pending, h("div", { className: "composer" }, h("div", { className: "composer-box" }, box, ui.toolbar))),
+      h("main", {}, ui.turns, ui.sessionUsage, ui.pending, h("div", { className: "composer" }, h("div", { className: "composer-box" }, box, ui.toolbar))),
       ui.drop,
     ),
   );
@@ -766,10 +771,15 @@ function onStream(turn: Turn, msg: StreamMsg) {
     case "approval.responded":
       turn.notice.textContent = "";
       return;
-    case "run.completed":
+    case "run.completed": {
       if (!turn.reply && typeof ev.output === "string") appendReply(turn, ev.output);
+      const usage = runUsage(ev.usage);
+      if (usage) turn.root.appendChild(h("div", { className: "usage", textContent: describeUsage(usage) }));
+      if (usage && overSsh) sshUsage = addUsage(sshUsage, usage);
+      renderSessionUsage(); // over SSH the totals are ours, so they update even if the list doesn't
       setStatus(turn, "done");
       return void refreshSessions();
+    }
     case "run.failed":
       turn.runId = undefined;
       setStatus(turn, "failed", `Run failed: ${String(ev.error ?? "unknown error")}`);
@@ -801,6 +811,8 @@ function markCurrent() {
 function newChat() {
   leave();
   sessionId = null;
+  sshUsage = null;
+  renderSessionUsage();
   choice = DEFAULT_CHOICE;
   lastChoice = DEFAULT_CHOICE; // a choice made before the first message is a change too
   renderChoice();
@@ -811,6 +823,8 @@ function newChat() {
 async function openSession(id: string) {
   leave();
   sessionId = id;
+  sshUsage = null;
+  renderSessionUsage();
   choice = loadChoice(localStorage, choiceKey(connection, profile, id));
   lastChoice = choice;
   renderChoice();
@@ -845,8 +859,19 @@ async function removeSession(id: string) {
   await refreshSessions();
 }
 
+/** The open Session's running totals and cost, from its Session record (over SSH: this view's Turns). */
+function renderSessionUsage() {
+  const record = sessions.find((s) => s.id === sessionId);
+  const usage = overSsh ? sshUsage : record && sessionUsage(record);
+  const cost = overSsh ? "cost unavailable over SSH" : describeCost(record?.estimated_cost_usd);
+  ui!.sessionUsage.hidden = !usage;
+  ui!.sessionUsage.textContent = usage ? `Session: ${[describeUsage(usage), cost].filter(Boolean).join(" · ")}` : "";
+  ui!.sessionUsage.title = overSsh
+    ? "Turns sent since this Session was opened. Over SSH, Hermes reports each Turn's tokens but not a Session's stored totals or cost."
+    : "";
+}
+
 async function refreshSessions() {
-  let sessions: Session[];
   try {
     sessions = await invoke<Session[]>("list_sessions");
   } catch (e) {
@@ -875,6 +900,7 @@ async function refreshSessions() {
     }),
   );
   markCurrent();
+  renderSessionUsage();
 }
 
 /** Fills the Profile selector and opens this connection's starting Profile. */

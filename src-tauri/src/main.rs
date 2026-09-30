@@ -715,7 +715,10 @@ async fn stream_acp(
             }
             let _ = match result {
                 Err(Error::Unreachable(message)) => channel.send(StreamMsg::Dropped { message }),
-                result => channel.send(StreamMsg::Event { data: acp::finished(result) }),
+                result => {
+                    let data = acp::finished(result, |r| hermes.turn_usage(&session, r));
+                    channel.send(StreamMsg::Event { data })
+                }
             };
         }
         hermes.unsubscribe(&session);

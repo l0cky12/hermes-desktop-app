@@ -1,6 +1,6 @@
 # Hermes Desktop
 
-A small Tauri client for a self-hosted Hermes Agent gateway: pairing and sign-in, streaming chat with tool progress and Stop, a Sessions panel, Profile, model, and Reasoning level pickers, Dictation, drag-and-drop, picked, and pasted attachments, Appearance settings, and, from the icon rail, the Hermes Kanban Board, Skills with on/off toggles, and the Client log. Vocabulary is in [CONTEXT.md](CONTEXT.md).
+A small Tauri client for a self-hosted Hermes Agent gateway: pairing and sign-in, streaming chat with tool progress and Stop, token Usage and cost, a Sessions panel, Profile, model, and Reasoning level pickers, Dictation, drag-and-drop, picked, and pasted attachments, Appearance settings, and, from the icon rail, the Hermes Kanban Board, Skills with on/off toggles, and the Client log. Vocabulary is in [CONTEXT.md](CONTEXT.md).
 
 ## Install on Arch Linux
 
@@ -34,8 +34,8 @@ Then, with Node 20+ and a stable Rust toolchain:
 npm install
 npm run tauri dev                    # development window
 npm run tauri build -- --no-bundle   # release binary: src-tauri/target/release/hermes-desktop
-(cd src-tauri && cargo test)         # SSE parser, URL validation, cookie jar, attachments, pickers, SSH quoting, Board/Skills parsing, Client log
-npm test                             # webview preferences (Node 22.18+)
+(cd src-tauri && cargo test)         # SSE parser, URL validation, cookie jar, attachments, pickers, SSH quoting, ACP Usage, Board/Skills parsing, Client log
+npm test                             # webview preferences, Usage formatting (Node 22.18+)
 ```
 
 ## Pairing
@@ -68,6 +68,15 @@ The bar under the message box picks the **Profile** (person icon), model (CPU ic
 - The model list shows only providers you've set up.
 - The model and Reasoning level belong to each Session, can change partway through it, and take effect from the next Turn. A small label marks the first reply after a change.
 - Over SSH, the Reasoning level comes from the Profile's config and can't be changed here.
+
+## Usage and cost
+
+Under each reply a small line shows the Turn's tokens in and out, and how much of the input was read from the prompt cache. Above the message box, the open Session's running totals and cost come from Hermes's Session record and refresh when a Turn finishes or fails. Costs are Hermes's own estimate from its price list, hence the `≈`; a model Hermes has no price for shows no cost.
+
+- Hermes doesn't report cost per Run yet, so cost shows for the whole Session only.
+- A Stopped Turn shows no Usage line. Hermes still adds what it spent to the Session totals, which show it after the next Turn (over SSH, it counts toward the next Turn's tokens).
+- Hermes doesn't store per-Turn usage, so a reopened Session shows its totals but not each earlier Turn's.
+- Over SSH, Hermes reports each Turn's tokens but no stored totals or cost: the Session line sums the Turns sent since you opened it, and cost is unavailable.
 
 ## Dictation
 

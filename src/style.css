@@ -108,7 +108,8 @@ main { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .user { background: var(--accent-bg); padding: 0.571rem 0.857rem; border-radius: 0.571rem; margin-bottom: 0.571rem; }
 .turn[data-status="not-sent"] .user { opacity: 0.6; border: 1px dashed var(--error); }
 .reply:empty { display: none; }
-.model-label { color: var(--muted); font-size: 0.8rem; margin-top: 0.286rem; }
+.model-label, .usage { color: var(--muted); font-size: 0.8rem; margin-top: 0.286rem; }
+.session-usage { color: var(--muted); font-size: 0.8rem; margin: 0; padding: 0.286rem 1.429rem 0; }
 pre { background: var(--pre-bg); color: var(--pre-text); padding: 0.714rem; border-radius: 0.429rem; overflow-x: auto; white-space: pre; }
 code { font: 0.9rem ui-monospace, monospace; background: var(--code-bg); padding: 0.071rem 0.286rem; border-radius: 0.286rem; }
 pre code { background: none; padding: 0; }
