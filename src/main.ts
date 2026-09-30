@@ -860,16 +860,18 @@ async function refreshSessions() {
 }
 
 /** Shown at once, put back if Hermes refuses. */
-async function togglePin(s: Session) {
-  const pinned = !s.pinned;
-  s.pinned = pinned;
-  renderSessions();
-  try {
-    await invoke("pin_session", { id: s.id, pinned });
-    ui!.sessionsError.textContent = "";
-  } catch (e) {
-    s.pinned = !pinned;
+async function togglePin(id: string, pinned: boolean) {
+  // Looked up by id each time: refreshSessions() may have replaced the list while Hermes answers.
+  const flip = (v: boolean) => {
+    const s = sessions.find((x) => x.id === id);
+    if (s) s.pinned = v;
     renderSessions();
+  };
+  flip(pinned);
+  try {
+    await invoke("pin_session", { id, pinned });
+  } catch (e) {
+    flip(!pinned);
     ui!.sessionsError.textContent = `Couldn't ${pinned ? "pin" : "unpin"} the session: ${asError(e).message}`;
   }
 }
@@ -895,7 +897,7 @@ function renderSessions() {
       pin.setAttribute("aria-pressed", String(!!s.pinned));
       pin.onclick = (e) => {
         e.stopPropagation();
-        void togglePin(s);
+        void togglePin(s.id, !s.pinned);
       };
       const li = h("li", { onclick: () => openSession(s.id) }, h("span", { textContent: s.title || s.preview || s.id }), pin, ...(overSsh ? [] : [del]));
       li.dataset.id = s.id;
