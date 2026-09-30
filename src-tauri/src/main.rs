@@ -558,13 +558,17 @@ async fn retitle_session(state: State<'_, AppState>, id: String) -> Result<Strin
         // Loading the transcript over ACP would take the streaming reply's updates.
         return Err(Error::Invalid("Over SSH, a session can be retitled once its reply finishes".into()));
     }
+    let profile = state.lock().profile.clone();
+    // The model may take a minute; if the Profile changed meanwhile, the scratch delete and the
+    // rename would otherwise go out under the new Profile's key.
+    let same_profile = || (state.lock().profile == profile).then_some(()).ok_or_else(|| Error::Invalid("The profile changed while retitling".into()));
     let messages = session_messages(state.clone(), id.clone()).await?;
     let prompt = title::prompt(messages.as_array().map_or(&[][..], Vec::as_slice))
         .ok_or_else(|| Error::Invalid("This session has no messages to title yet".into()))?;
     let no_title = || Error::Http("The model didn't reply with a usable title".into());
     if let Some(host) = state.ssh_host() {
-        let profile = state.lock().profile.clone();
         let result = remote::chat_result(&remote::run(&host, remote::ask(profile.as_deref(), &prompt)).await?)?;
+        same_profile()?;
         if let Some(scratch) = result["session_id"].as_str().filter(|s| !s.is_empty() && *s != id) {
             let _ = remote::run(&host, remote::sessions_delete(profile.as_deref(), scratch)).await;
         }
@@ -577,6 +581,7 @@ async fn retitle_session(state: State<'_, AppState>, id: String) -> Result<Strin
     let response = send(&state.slow_client, request).await?;
     let scratch = response.headers().get("X-Hermes-Session-Id").and_then(|v| v.to_str().ok()).map(str::to_owned);
     let reply = json_body(response).await?["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_owned();
+    same_profile()?;
     if let Some(scratch) = scratch.filter(|s| *s != id) {
         let _ = send(&state.client, state.api(Method::DELETE, &["api", "sessions", &scratch], &[])?).await;
     }
