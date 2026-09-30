@@ -420,7 +420,9 @@ serve(API_PORT, "api", async (req, res, url) => {
   if (route === "GET /api/sessions") {
     const limit = Math.min(Number(url.searchParams.get("limit") ?? 50), 200);
     const all = Object.values(state.sessions).filter((s) => (s.profile ?? "default") === profile).sort((x, y) => y.last_active - x.last_active);
-    return send(res, 200, { object: "list", data: all.slice(0, limit), limit, offset: 0, has_more: all.length > limit });
+    // Like include_pinned=True: pinned Sessions past the limit are back-filled after the page.
+    const data = [...all.slice(0, limit), ...all.slice(limit).filter((s) => s.pinned)];
+    return send(res, 200, { object: "list", data, limit, offset: 0, has_more: all.length > limit });
   }
   if (route === "POST /api/sessions") {
     const body = (await readJson(req)) ?? {};
@@ -437,7 +439,9 @@ serve(API_PORT, "api", async (req, res, url) => {
     if (route === "GET /api/sessions/:id") return send(res, 200, { object: "hermes.session", session });
     if (route === "PATCH /api/sessions/:id") {
       const body = (await readJson(req)) ?? {};
+      if ("pinned" in body && typeof body.pinned !== "boolean") return send(res, 400, { error: { message: "'pinned' must be a boolean", code: "invalid_session_field" } });
       if ("title" in body) session.title = body.title;
+      if ("pinned" in body) session.pinned = body.pinned;
       save();
       return send(res, 200, { object: "hermes.session", session });
     }

@@ -98,7 +98,13 @@ dialog::backdrop { background: rgb(0 0 0 / 0.35); }
 .sessions { list-style: none; margin: 0; padding: 0; flex: 1; overflow-y: auto; }
 .sessions li { display: flex; justify-content: space-between; gap: 0.429rem; padding: 0.5rem 0.571rem; border-radius: 0.429rem; cursor: pointer; }
 .sessions li button { white-space: nowrap; flex-shrink: 0; }
-.sessions li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sessions li span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sessions li .pin { display: inline-flex; align-items: center; background: none; color: var(--muted); padding: 0 0.143rem; opacity: 0; }
+.sessions li:hover .pin, .sessions li .pin:focus-visible, .sessions li.pinned .pin { opacity: 1; }
+.sessions li .pin:hover { color: var(--text); }
+.sessions li.pinned .pin { color: var(--accent-text); }
+.sessions li.pinned .pin svg { fill: currentColor; }
+.sessions li.pinned + li:not(.pinned) { margin-top: 0.286rem; border-top: 1px solid var(--line); }
 .sessions li:hover { background: var(--hover); }
 .sessions li.current { background: var(--accent-bg-strong); font-weight: 500; }
 main { display: flex; flex-direction: column; min-height: 0; min-width: 0; }

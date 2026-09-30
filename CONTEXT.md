@@ -50,6 +50,10 @@ _Avoid_: account, persona, agent, user
 A conversation transcript stored on the API server under one Profile; never the Sign-in cookie.
 _Avoid_: chat, thread, conversation
 
+**Pin**:
+Hermes's own keep flag on a Session, shared by every client of that Profile; a Pinned Session sits above the rest of the Session list.
+_Avoid_: favorite, star, bookmark
+
 **Turn**:
 One user message plus the reply shown for it in the chat view.
 _Avoid_: message, exchange
