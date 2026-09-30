@@ -92,6 +92,12 @@ The dev mock (`node mock/server.mjs`) serves a small Board and Skills list too; 
 
 Every request goes directly to the configured gateway: system proxies are ignored, and redirects are never followed.
 
+## Regenerate
+
+**Regenerate** under the latest reply runs the same message again, on the model and Reasoning level picked now, and shows the new reply in its place. ‹ › under the reply switch between that Turn's replies.
+
+Hermes can't remove a reply from a Session, so the Session keeps them all. The new Run sees the reply it replaces. The next Turn follows all of them, whichever one is shown. Reopening the Session shows each one as its own Turn. After reopening, a message's images can't be sent again: Hermes keeps only a `[screenshot]` placeholder, and that text is what Regenerate sends.
+
 ## Attachments
 
 The API server has no upload endpoint, so Attachments ride inside the Run request. Drop files on the window, pick them with the paperclip, or paste an image.
