@@ -350,6 +350,9 @@ function streamEvents(res, run, lastSeq) {
 
 serve(API_PORT, "api", async (req, res, url) => {
   if (req.headers.origin) return res.writeHead(403).end(); // non-allowlisted Origin: bare 403, like the real server
+  if (Number(req.headers["content-length"]) > 10_000_000) { // MAX_REQUEST_BYTES
+    return send(res, 413, { error: { message: "Request body too large.", type: "invalid_request_error", param: null, code: "body_too_large" } });
+  }
   // /p/<profile>/... addresses a named Profile, like a multiplexing gateway.
   let profile = "default";
   const prefixed = url.pathname.match(/^\/p\/([^/]+)(\/.*)$/);
