@@ -583,12 +583,18 @@ function updateComposer() {
 
 /** Copies every Turn of the open Session, as the chat view shows it, to the clipboard. */
 async function copySession() {
-  await navigator.clipboard.writeText(transcriptMarkdown(turns.map((t) => ({
+  const md = transcriptMarkdown(turns.map((t) => ({
     text: t.text,
     attachments: t.files.map(attachmentName),
     tools: [...t.tools.querySelectorAll<HTMLElement>(".tool")].map((c) => c.dataset.tool!),
     reply: t.reply,
-  }))));
+  })));
+  try {
+    await navigator.clipboard.writeText(md);
+  } catch (e) {
+    ui!.composerError.textContent = `Couldn't copy: ${asError(e).message}`;
+    return;
+  }
   ui!.copied.textContent = "Copied";
   setTimeout(() => (ui!.copied.textContent = ""), 1500);
 }
