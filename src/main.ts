@@ -2,6 +2,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { field, h, icon, input } from "./dom";
 import { appearanceTab, applyAppearance } from "./appearance";
+import { exportHtml, exportMarkdown, fileName, textParts, transcriptTurns, type Message } from "./export";
 import {
   changeLabel, choiceKey, DEFAULT_CHOICE, loadChoice, REASONING_LEVELS, saveChoice, saveProfile, startProfile,
   type Choice, type ModelChoice,
@@ -14,8 +15,7 @@ type Status = { auth_required: boolean; auth_providers: string[] };
 type RunStarted = { run_id: string; session_id: string };
 type RunEvent = { event: string; seq?: number; [field: string]: unknown };
 type StreamMsg = { type: "event"; data: RunEvent } | { type: "dropped"; message: string };
-type Session = { id: string; title?: string | null; preview?: string | null; pinned?: boolean };
-type Message = { role: string; content: unknown; tool_calls?: { function?: { name?: string } }[] | null };
+type Session = { id: string; title?: string | null; preview?: string | null; pinned?: boolean; archived?: boolean };
 type Attachment = { path: string } | { name: string; data_url: string };
 type Models = { default: ModelChoice | null; groups: { provider: string; name: string; models: string[] }[] };
 type TurnStatus = "streaming" | "done" | "stopped" | "failed" | "not-sent";
@@ -332,7 +332,9 @@ let choice: Choice = DEFAULT_CHOICE; // what the next Turn in this view runs on
 let lastChoice: Choice | undefined; // what the previous Turn ran on, for the reply label
 let ui: {
   sessions: HTMLUListElement;
+  sessionsTitle: HTMLElement;
   sessionsError: HTMLElement;
+  archivedToggle: HTMLButtonElement;
   turns: HTMLElement;
   pending: HTMLElement;
   input: HTMLTextAreaElement;
@@ -359,7 +361,9 @@ function showChat(supported: boolean, ssh = false) {
   const unavailable = "Chat unavailable: this API server does not advertise run submission with event streaming.";
   ui = {
     sessions: h("ul", { className: "sessions" }),
+    sessionsTitle: h("h2", { textContent: "Sessions" }),
     sessionsError: h("p", { className: "error" }),
+    archivedToggle: h("button", { className: "link", textContent: "Archived", onclick: () => ((archivedView = !archivedView), void refreshSessions()) }),
     turns: h("div", { className: "turns" }),
     pending: h("div", { className: "pending" }),
     input: h("textarea", { placeholder: runs ? "Message Hermes. Drop, paste, or pick attachments." : unavailable, rows: 3 }),
@@ -422,9 +426,10 @@ function showChat(supported: boolean, ssh = false) {
     h(
       "div",
       { className: "chat" },
-      h("aside", {}, h("div", { className: "row" }, h("h2", { textContent: "Sessions" }),
+      h("aside", {}, h("div", { className: "row" }, ui.sessionsTitle,
         h("button", { className: "secondary", textContent: "New chat", onclick: newChat })), ui.sessionsError, ui.sessions,
-        h("footer", {}, h("button", { className: "icon-btn", title: "Settings", onclick: showSettings }, icon("settings"), "Settings"))),
+        h("footer", { className: "row" }, h("button", { className: "icon-btn", title: "Settings", onclick: showSettings }, icon("settings"), "Settings"),
+          ...(overSsh ? [] : [ui.archivedToggle]))),
       h("main", {}, ui.turns, ui.pending, h("div", { className: "composer" }, h("div", { className: "composer-box" }, box, ui.toolbar))),
       ui.drop,
     ),
@@ -648,26 +653,13 @@ async function copySession() {
   setTimeout(() => (ui!.copied.textContent = ""), 1500);
 }
 
-const FENCE = /```(?:[^\n`]*\n)?([\s\S]*?)```/;
-
 /** Fenced code and `inline code` only; everything else is plain text. Never innerHTML. */
 function renderText(el: HTMLElement, text: string) {
   el.replaceChildren(
-    ...text.split(new RegExp(FENCE, "g")).flatMap((part, i) =>
-      i % 2
-        ? [h("pre", {}, h("code", { textContent: part }))]
-        : part.split(/`([^`\n]+)`/).map((s, j) => (j % 2 ? h("code", { textContent: s }) : document.createTextNode(s))),
+    ...textParts(text).map((p) =>
+      p.kind === "pre" ? h("pre", {}, h("code", { textContent: p.text })) : p.kind === "code" ? h("code", { textContent: p.text }) : document.createTextNode(p.text),
     ),
   );
-}
-
-function contentText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((part) => (part?.type === "text" ? String(part.text) : part?.type === "image_url" ? "[image]" : ""))
-    .filter(Boolean)
-    .join("\n");
 }
 
 function scrollToEnd() {
@@ -889,7 +881,8 @@ function newChat() {
   markCurrent();
 }
 
-async function openSession(id: string) {
+/** `false` when the Session couldn't be loaded; the chat view shows why instead. */
+async function openSession(id: string): Promise<boolean> {
   leave();
   sessionId = id;
   choice = loadChoice(localStorage, choiceKey(connection, profile, id));
@@ -901,19 +894,17 @@ async function openSession(id: string) {
   ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "Loading…" }));
   try {
     const messages = await invoke<Message[]>("session_messages", { id });
-    if (sessionId !== id) return;
+    if (sessionId !== id) return false;
     ui!.turns.replaceChildren(h("p", { className: "empty", textContent: "This session has no messages yet." }));
-    let turn: Turn | null = null;
-    for (const m of messages) {
-      const text = contentText(m.content);
-      if (m.role === "user") turn = addTurn(text, []);
-      if (m.role !== "assistant") continue;
-      turn ??= addTurn("", []);
-      for (const call of m.tool_calls ?? []) addTool(turn, call.function?.name ?? "tool", "", "done");
-      if (text) appendReply(turn, (turn.reply ? "\n\n" : "") + text);
+    for (const t of transcriptTurns(messages)) {
+      const turn = addTurn(t.user, []);
+      for (const tool of t.tools) addTool(turn, tool, "", "done");
+      if (t.reply) appendReply(turn, t.reply);
     }
+    return true;
   } catch (e) {
     ui!.turns.replaceChildren(h("p", { className: "error", textContent: `Couldn't load this session: ${asError(e).message}` }));
+    return false;
   }
 }
 
@@ -928,9 +919,14 @@ async function removeSession(id: string) {
   await refreshSessions();
 }
 
+let archivedView = false; // the Sessions panel lists archived Sessions instead (API server only)
+let sessionMenu: HTMLElement | null = null;
+
+const sessionTitle = (s: Session) => s.title || s.preview || s.id;
+
 async function refreshSessions() {
   try {
-    sessions = await invoke<Session[]>("list_sessions");
+    sessions = await invoke<Session[]>(archivedView ? "archived_sessions" : "list_sessions");
   } catch (e) {
     const x = asError(e);
     ui!.sessionsError.textContent = `Couldn't load sessions: ${x.message}`;
@@ -959,21 +955,14 @@ async function togglePin(id: string, pinned: boolean) {
 }
 
 function renderSessions() {
+  ui!.sessionsTitle.textContent = archivedView ? "Archived" : "Sessions";
+  ui!.archivedToggle.textContent = archivedView ? "Back to sessions" : "Archived";
+  closeSessionMenu();
   // Pinned Sessions first; sort is stable, so each group keeps the gateway's newest-first order.
   const ordered = [...sessions].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned));
   ui!.sessions.replaceChildren(
     ...ordered.map((s) => {
-      const del = h("button", { className: "link", textContent: "Delete" });
-      del.onclick = (e) => {
-        e.stopPropagation();
-        if (del.dataset.armed) return void removeSession(s.id);
-        del.dataset.armed = "1";
-        del.textContent = "Confirm delete";
-        setTimeout(() => {
-          delete del.dataset.armed;
-          del.textContent = "Delete";
-        }, 3000);
-      };
+      const title = h("span", { textContent: sessionTitle(s) });
       const pin = h("button", { className: "pin", title: s.pinned ? "Unpin" : "Pin to the top" }, icon("pin", 14));
       pin.setAttribute("aria-label", "Pin");
       pin.setAttribute("aria-pressed", String(!!s.pinned));
@@ -981,13 +970,114 @@ function renderSessions() {
         e.stopPropagation();
         void togglePin(s.id, !s.pinned);
       };
-      const li = h("li", { onclick: () => openSession(s.id) }, h("span", { textContent: s.title || s.preview || s.id }), pin, ...(overSsh ? [] : [del]));
+      const more = h("button", { className: "icon-btn", title: "Session actions" }, icon("ellipsis"));
+      more.setAttribute("aria-label", "Session actions");
+      more.onclick = (e) => (e.stopPropagation(), toggleSessionMenu(s, more, title));
+      const li = h("li", { onclick: () => (closeSessionMenu(), void openSession(s.id)) }, title, pin, more);
       li.dataset.id = s.id;
       li.classList.toggle("pinned", !!s.pinned);
       return li;
     }),
   );
   markCurrent();
+}
+
+/** Runs a Session action, then reloads the list; a failure shows above it as "Couldn't <what>: …". */
+async function sessionAction(what: string, run: () => Promise<unknown>) {
+  let error = "";
+  try {
+    await run();
+  } catch (e) {
+    error = `Couldn't ${what}: ${asError(e).message}`;
+  }
+  await refreshSessions();
+  if (error) ui!.sessionsError.textContent = error;
+}
+
+function closeSessionMenu() {
+  sessionMenu?.remove();
+  sessionMenu = null;
+}
+
+/** The ⋯ menu on a Session row. Archive and Delete need the API server, so they're missing over SSH. */
+function toggleSessionMenu(s: Session, more: HTMLElement, title: HTMLElement) {
+  const wasOpen = sessionMenu?.parentElement === more.parentElement;
+  closeSessionMenu();
+  if (wasOpen) return;
+  const act = (label: string, run: () => unknown) =>
+    h("button", { type: "button", textContent: label, onclick: () => (closeSessionMenu(), void run()) });
+  const del = h("button", { type: "button", textContent: "Delete" });
+  del.onclick = () => {
+    if (!del.dataset.armed) return void ((del.dataset.armed = "1"), (del.textContent = "Confirm delete"));
+    closeSessionMenu();
+    void removeSession(s.id);
+  };
+  const archive = !archivedView;
+  const menu = h(
+    "div",
+    { className: "menu session-menu", onclick: (e) => e.stopPropagation() },
+    act("Rename", () => renameSession(s, title)),
+    act("Duplicate", () => sessionAction("duplicate the session", async () => void openSession(await invoke<string>("duplicate_session", { id: s.id, title: `${sessionTitle(s)} (copy)` })))),
+    ...(overSsh ? [] : [act(archive ? "Archive" : "Unarchive", () => sessionAction(`${archive ? "archive" : "unarchive"} the session`, async () => {
+      await invoke("archive_session", { id: s.id, archived: archive });
+      if (archive && s.id === sessionId) newChat();
+    }))]),
+    act("Export as Markdown…", () => exportSession(s, "md")),
+    act("Export as HTML…", () => exportSession(s, "html")),
+    act("Export as PDF…", () => printSession(s)),
+    ...(overSsh ? [] : [del]),
+  );
+  menu.onkeydown = (e) => void (e.key === "Escape" && (closeSessionMenu(), more.focus()));
+  more.after(menu);
+  sessionMenu = menu;
+  // Fixed, so the scrolling Sessions list can't clip it; kept inside the window.
+  const at = more.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, at.right - menu.offsetWidth)}px`;
+  menu.style.top = `${Math.min(at.bottom + 4, innerHeight - menu.offsetHeight - 8)}px`;
+  (menu.firstElementChild as HTMLElement).focus();
+}
+
+/** Swaps the row's title for a text box: Enter or leaving it saves, Escape cancels. */
+function renameSession(s: Session, title: HTMLElement) {
+  const box = h("input", { value: s.title ?? "", placeholder: sessionTitle(s), required: false, onclick: (e) => e.stopPropagation() });
+  let done = false;
+  const finish = (save: boolean) => {
+    if (done) return;
+    done = true;
+    const name = box.value.trim();
+    if (!save || !name || name === s.title) {
+      box.replaceWith(title); // nothing to save: no round trip
+      return;
+    }
+    void sessionAction("rename the session", () => invoke("rename_session", { id: s.id, title: name }));
+  };
+  box.onkeydown = (e) => {
+    if (e.key === "Enter") finish(true);
+    if (e.key === "Escape") finish(false);
+  };
+  box.onblur = () => finish(true);
+  title.replaceWith(box);
+  box.select();
+}
+
+/** Export as Markdown or HTML: a file saved wherever the user picks, the way to hand a Session to someone else. */
+async function exportSession(s: Session, ext: "md" | "html") {
+  try {
+    const turns = transcriptTurns(await invoke<Message[]>("session_messages", { id: s.id }));
+    const title = sessionTitle(s);
+    const markdown = ext === "md" ? exportMarkdown(title, turns) : null;
+    await invoke("save_file", { name: fileName(title, ext), html: exportHtml(title, turns), markdown });
+  } catch (e) {
+    ui!.sessionsError.textContent = `Couldn't export the session: ${asError(e).message}`;
+  }
+}
+
+/** Export as PDF: opens the Session, then the system print dialog (which can save a PDF) prints the chat view's print stylesheet. */
+async function printSession(s: Session) {
+  if (!(await openSession(s.id))) return;
+  ui!.turns.prepend(h("h1", { className: "print-only", textContent: sessionTitle(s) }));
+  await new Promise((painted) => requestAnimationFrame(() => setTimeout(painted))); // print() blocks painting until the dialog closes
+  print();
 }
 
 /** Fills the Profile selector and opens this connection's starting Profile. */
@@ -1104,6 +1194,7 @@ function toggleModelMenu() {
 
 document.addEventListener("pointerdown", (e) => {
   if (ui && !ui.modelPicker.contains(e.target as Node)) ui.menu.remove();
+  if (sessionMenu && !sessionMenu.parentElement!.contains(e.target as Node)) closeSessionMenu();
 });
 
 // ---- Shell: icon rail and views ----

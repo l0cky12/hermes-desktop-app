@@ -60,6 +60,14 @@ Host hermes-box
 ## Sessions
 
 The Sessions panel lists the active Profile's Sessions, newest first. The pin button (shown on hover or keyboard focus) Pins a Session: Pinned Sessions stay above the rest, and the pin is Hermes's own flag (`PATCH /api/sessions/{id}`, or `hermes sessions pin` over SSH), so it survives restarts and shows on every client of that Profile. If Hermes refuses, the Session goes back where it was and the panel says why.
+Each Session in the Sessions panel has a ⋯ menu:
+
+- **Rename** edits the title in place (Enter saves, Escape cancels).
+- **Duplicate** copies the whole transcript into a new Session titled "… (copy)" and opens it. Over HTTP, Hermes marks the original as ended ("branched"); you can keep chatting in it.
+- **Archive** hides a Session from the list without deleting it. **Archived** at the bottom of the panel lists archived Sessions (from the Dashboard), where **Unarchive** brings one back.
+- **Export as Markdown / HTML** saves the transcript wherever you pick. That's also how to share a Session: Hermes has no share links.
+- **Export as PDF** opens the Session and the system print dialog; pick "Print to File" or "Save as PDF". Only the title and Turns print.
+- Over SSH, Archive and Delete aren't offered: `hermes sessions archive` only works in bulk, and ACP can't delete.
 
 ## Profiles, models, and reasoning
 

@@ -164,6 +164,11 @@ fn profile_home(profile: Option<&str>) -> String {
     format!("home=$({} config path | tail -n 1) && home=${{home%/*}} || exit 1", bin(profile))
 }
 
+/// `hermes [-p P] sessions rename -- <id> <title>`: the title stays one argument, so its spacing survives.
+pub fn sessions_rename(profile: Option<&str>, id: &str, title: &str) -> Cmd {
+    hermes_as(profile, "hermes sessions rename", &["--".into(), id.into(), title.into()])
+}
+
 /// The disabled list, then every SKILL.md's frontmatter under the Profile's skills directory,
 /// skipping hidden directories as Hermes does (`.archive`, `.hub`, …). Parsed by
 /// `work::skills_from_ssh`.
@@ -242,6 +247,15 @@ mod tests {
         assert_eq!(argv_seen_by_hermes(&sessions_pin(Some("coder"), "-s_1", true)), ["-p", "coder", "sessions", "pin", "--", "-s_1"]);
         assert_eq!(argv_seen_by_hermes(&sessions_pin(None, "it's", false)), ["sessions", "unpin", "--", "it's"]);
         assert_eq!(argv_seen_by_hermes(&sessions_pinned(Some("coder"))), ["-p", "coder", "sessions", "pinned", "--json"]);
+    }
+
+    #[test]
+    fn renaming_passes_the_profile_then_id_and_title_as_positionals() {
+        for title in NASTY {
+            let cmd = sessions_rename(Some("coder"), "-s_1", title);
+            assert_eq!(argv_seen_by_hermes(&cmd), ["-p", "coder", "sessions", "rename", "--", "-s_1", title]);
+        }
+        assert_eq!(argv_seen_by_hermes(&sessions_rename(None, "s", "a  b")), ["sessions", "rename", "--", "s", "a  b"]);
     }
 
     #[test]

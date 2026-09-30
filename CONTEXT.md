@@ -78,6 +78,14 @@ _Avoid_: upload, file
 Speaking into the microphone to fill the message box with text the user can edit before sending.
 _Avoid_: voice mode, TTS
 
+**Archive**:
+Hiding a Session from the Sessions list without deleting it; an archived Session can be unarchived.
+_Avoid_: hide, trash
+
+**Export**:
+Saving a Session's transcript as a Markdown, HTML, or PDF file outside Hermes.
+_Avoid_: download, share (Hermes has no share links)
+
 **Retry**:
 Recovering a failed, stopped, or not-sent Turn: reattaching to its Run's event stream where it left off, or starting a new Run with the same input in the same Session when that Run is gone.
 _Avoid_: resend, regenerate
