@@ -1290,12 +1290,15 @@ function kanbanView(): View {
   }
 
   async function openDrawer(id: string) {
+    const loading = board;
     drawer.hidden = false;
     drawer.replaceChildren(h("p", { className: "loading", textContent: "Loading…" }));
     let detail: Detail;
     try {
       detail = await kanban<Detail>("kanban_task", { id });
+      if (loading !== board) return; // Board switched meanwhile: this Task belongs to the old one
     } catch (e) {
+      if (loading !== board) return;
       drawer.replaceChildren(closeButton(), h("p", { className: "error", textContent: `Couldn't load ${id}: ${asError(e).message}` }));
       return;
     }
