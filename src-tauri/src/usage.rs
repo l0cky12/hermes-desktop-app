@@ -99,6 +99,7 @@ pub struct Window {
 /// `hermes usage --json` (hermes_cli/subcommands/usage.py): the Profile's provider account limits.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct Limit {
+    #[serde(default)]
     pub provider: String,
     #[serde(default)]
     pub title: Option<String>,
