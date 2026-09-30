@@ -656,7 +656,7 @@ function setStatus(turn: Turn, status: TurnStatus, message = "") {
     showVersion(turn, turn.versions.length - 1); // the Run writes into the newest reply
     turn.statusEl.replaceChildren(h("span", { className: "typing", textContent: "Hermes is working…" }));
   } else if (status === "done") {
-    const regenerable = turn.root === ui!.turns.lastElementChild && !!turn.reply && !!(turn.text || turn.files.length);
+    const regenerable = runs && turn.root === ui!.turns.lastElementChild && !!(turn.text || turn.files.length);
     const button = h("button", { className: "link regenerate", textContent: "Regenerate", title: "Run this message again for a new reply", onclick: () => regenerate(turn) });
     turn.statusEl.replaceChildren(...pager(turn), ...(regenerable ? [button] : []));
   } else turn.statusEl.replaceChildren(...pager(turn), h("span", { textContent: message }), h("button", { className: "secondary", textContent: "Retry", onclick: () => retry(turn) }));
@@ -775,7 +775,7 @@ async function retry(turn: Turn) {
 // ponytail: the API server can't drop a reply, so the Run is appended to the Session, which keeps every reply
 // and shows them to the model; trim the Session before the Turn once Hermes can rewind one over HTTP.
 async function regenerate(turn: Turn) {
-  if (active) return;
+  if (active || !runs) return;
   turn.tools = h("div", { className: "tools" });
   turn.replyEl = h("div", { className: "reply" });
   turn.versions.push(h("div", {}, turn.tools, turn.replyEl));
