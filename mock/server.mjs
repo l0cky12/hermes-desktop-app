@@ -135,13 +135,14 @@ serve(DASH_PORT, "dashboard", async (req, res, url) => {
     const profileName = url.searchParams.get("profile") ?? "default";
     return send(res, 200, { ok: true, transcript: `hello from the mock microphone (${profileName})`, provider: "mock" });
   }
+  if (url.pathname.startsWith("/api/mcp/")) return work(req, res, url);
   if (url.pathname.startsWith("/api/plugins/kanban/") || url.pathname.startsWith("/api/skills")) {
     return work(req, res, url);
   }
   send(res, 404, { detail: "Not Found" });
 });
 
-// Board and Skills, shaped like plugins/kanban/dashboard/plugin_api.py and web_routers/skills.py.
+// Board, Skills, and MCP servers, shaped like plugins/kanban/dashboard/plugin_api.py, web_routers/skills.py, and web_routers/mcp.py.
 // In memory only; "MOCK_KANBAN=off" answers 404 like a disabled Kanban plugin.
 const task = (id, status, title, extra = {}) =>
   ({ id, title, body: `Body of ${title}.`, assignee: null, status, priority: 0, tenant: null, created_at: Math.floor(now()) - 3600, ...extra });
@@ -161,9 +162,22 @@ const skills = [
   { name: "ad-cs-certificate-request", description: "Request AD CS certificates.", category: "devops", enabled: true },
 ];
 
+const mcpServer = (name, extra) => ({ name, transport: "stdio", url: null, command: null, args: [], env: {}, auth: null, enabled: true, tools: null, source: "config", plugin: null, ...extra });
+const mcpServers = [
+  mcpServer("github", { command: "npx", args: ["-y", "@modelcontextprotocol/server-github"], env: { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_...9f3a" }, tools: { exclude: ["delete_repository"] } }),
+  mcpServer("linear", { transport: "http", url: "https://mcp.linear.app/sse", auth: "oauth" }),
+  mcpServer("filesystem", { command: "mcp-server-filesystem", args: ["/srv/shared"], enabled: false }),
+  mcpServer("deepwiki", { transport: "http", url: "https://mcp.deepwiki.com/mcp", source: "plugin", plugin: "deepwiki" }),
+];
+const mcpTools = [
+  { name: "search_issues", description: "Search issues and pull requests.", schema_chars: 612 },
+  { name: "create_issue", description: "Open a new issue in a repository.", schema_chars: 845 },
+  { name: "get_file_contents", description: "Read a file from a repository." },
+];
+
 async function work(req, res, url) {
   const path = url.pathname.replace("/api/plugins/kanban", "kanban");
-  const route = `${req.method} ${path.replace(/t_[0-9a-z]+/, ":id")}`;
+  const route = `${req.method} ${path.replace(/t_[0-9a-z]+/, ":id").replace(/^\/api\/mcp\/servers\/[^/]+\/test$/, "/api/mcp/servers/:name/test")}`;
   const id = path.match(/t_[0-9a-z]+/)?.[0];
   if (path.startsWith("kanban") && env.MOCK_KANBAN === "off") return send(res, 404, { detail: "Not Found" });
   switch (route) {
@@ -202,6 +216,16 @@ async function work(req, res, url) {
       const found = skills.find((s) => s.name === url.searchParams.get("name"));
       return found ? send(res, 200, { name: found.name, content: `---\nname: ${found.name}\ndescription: ${found.description}\n---\n\n# ${found.name}\n\nMock SKILL.md.\n`, path: "/mock" })
         : send(res, 404, { detail: "Skill not found." });
+    }
+    case "GET /api/mcp/servers":
+      return send(res, 200, { servers: [...mcpServers].sort((a, b) => a.name.localeCompare(b.name)) });
+    case "POST /api/mcp/servers/:name/test": {
+      const name = decodeURIComponent(path.split("/")[4]);
+      if (!mcpServers.some((s) => s.name === name)) return send(res, 404, { detail: `Server '${name}' not found` });
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      if (name === "linear") return send(res, 200, { ok: false, error: "OAuth authentication required — no token found.", tools: [] });
+      if (name !== "github") return send(res, 200, { ok: false, error: "Connection failed: [Errno 111] Connection refused", tools: [] });
+      return send(res, 200, { ok: true, tools: mcpTools, prompts: 0, resources: 2 });
     }
     case "PUT /api/skills/toggle": {
       const body = await readJson(req);

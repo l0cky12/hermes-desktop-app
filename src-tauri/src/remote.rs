@@ -1,4 +1,4 @@
-//! One-shot `ssh <host> hermes …` commands for the Board and Skills (ADR 0002), separate from
+//! One-shot `ssh <host> hermes …` commands for the Board, Skills, and MCP servers (ADR 0002), separate from
 //! the long-lived `hermes acp` connection. Every argument reaches the remote POSIX shell, so
 //! each one is single-quoted; Task bodies go on stdin, never on the command line.
 
@@ -173,6 +173,25 @@ pub fn skills_set_disabled(names: &[String]) -> Cmd {
     hermes("hermes config set", &["skills.disabled".into(), serde_json::to_string(names).expect("serializable")])
 }
 
+/// `-p <profile> ` for a `hermes` command line, or nothing for the Gateway's default Profile.
+fn profile_flag(profile: Option<&str>) -> String {
+    profile.map(|p| format!("-p {} ", quote(p))).unwrap_or_default()
+}
+
+/// The Profile's `mcp_servers` config. Hermes masks secret-looking values under secret-looking
+/// keys only, so env values are dropped in `work`.
+pub fn mcp_servers(profile: Option<&str>) -> Cmd {
+    let script = format!("exec hermes {}config get mcp_servers --json", profile_flag(profile));
+    Cmd { summary: "hermes config get mcp_servers", script, stdin: None }
+}
+
+/// Connects to one MCP server and prints its tools; exits 1 if it can't connect, 3 if there's no
+/// such server. stderr joins stdout so a failure's reason is what `run` reports.
+pub fn mcp_test(profile: Option<&str>, name: &str) -> Cmd {
+    let script = format!("exec hermes {}mcp test -- {} 2>&1", profile_flag(profile), quote(name));
+    Cmd { summary: "hermes mcp test", script, stdin: None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +300,28 @@ mod tests {
             let out = std::process::Command::new("sh").arg("-c").arg(format!("printf %s {}", quote(arg))).output().unwrap();
             assert_eq!(String::from_utf8(out.stdout).unwrap(), arg);
         }
+    }
+
+    #[test]
+    fn mcp_servers_are_read_for_the_profile() {
+        assert_eq!(argv_seen_by_hermes(&mcp_servers(Some("coder"))), ["-p", "coder", "config", "get", "mcp_servers", "--json"]);
+        assert_eq!(argv_seen_by_hermes(&mcp_servers(None)), ["config", "get", "mcp_servers", "--json"]);
+        for name in NASTY {
+            assert_eq!(argv_seen_by_hermes(&mcp_test(Some("coder"), name)), ["-p", "coder", "mcp", "test", "--", name]);
+        }
+        assert_eq!(argv_seen_by_hermes(&mcp_test(None, "gh")), ["mcp", "test", "--", "gh"]);
+    }
+
+    /// Read-only, like `reads_board_and_skills_from_real_hermes`.
+    #[tokio::test]
+    #[ignore]
+    async fn reads_and_tests_mcp_servers_from_real_hermes() {
+        let servers = crate::work::mcp_from_config(json(&run("localhost", mcp_servers(None)).await.unwrap()).unwrap());
+        for server in servers.iter().filter(|s| s.enabled) {
+            if let Ok(out) = run("localhost", mcp_test(None, &server.name)).await {
+                return assert!(!crate::work::mcp_test_from_cli(&out).tools.is_empty(), "{} lists no tools", server.name);
+            }
+        }
+        panic!("no enabled MCP server answered");
     }
 }

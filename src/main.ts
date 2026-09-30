@@ -996,9 +996,9 @@ document.addEventListener("pointerdown", (e) => {
 // ---- Shell: icon rail and views ----
 
 type View = { el: HTMLElement; show?: () => void; hide?: () => void };
-type ViewName = "chat" | "kanban" | "skills" | "logs";
+type ViewName = "chat" | "kanban" | "skills" | "mcp" | "logs";
 
-const LABELS: Record<ViewName, string> = { chat: "Chat", kanban: "Kanban", skills: "Skills", logs: "Logs" };
+const LABELS: Record<ViewName, string> = { chat: "Chat", kanban: "Kanban", skills: "Skills", mcp: "MCP servers", logs: "Logs" };
 
 let current: View | null = null;
 
@@ -1008,10 +1008,10 @@ document.addEventListener("keydown", (e) => {
   for (const drawer of document.querySelectorAll<HTMLElement>(".drawer")) drawer.hidden = true;
 });
 
-/** Replaces the app with the rail and its four views; Chat is shown first. */
+/** Replaces the app with the rail and its views; Chat is shown first. */
 function mountShell(chat: HTMLElement) {
   current?.hide?.();
-  const views: Record<ViewName, View> = { chat: { el: chat }, kanban: kanbanView(), skills: skillsView(), logs: logsView() };
+  const views: Record<ViewName, View> = { chat: { el: chat }, kanban: kanbanView(), skills: skillsView(), mcp: mcpView(), logs: logsView() };
   const buttons = (Object.keys(views) as ViewName[]).map((name) => {
     const button = h("button", { className: "rail-item", title: LABELS[name], onclick: () => select(name) });
     button.setAttribute("aria-label", LABELS[name]);
@@ -1031,13 +1031,13 @@ function mountShell(chat: HTMLElement) {
   select("chat");
 }
 
-/** Runs a Board or Skills command; a rejected Sign-in cookie gets the usual Re-auth prompt, then one retry. */
+/** Runs a Board, Skills, or MCP servers command; a rejected Sign-in cookie gets the usual Re-auth prompt, then one retry. */
 async function call<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
   try {
     return await invoke<T>(cmd, args);
   } catch (e) {
     if (asError(e).kind !== "unauthorized" || overSsh) throw e;
-    if (!signInRequired) throw { kind: "unauthorized", message: "Sign-in is required on the Dashboard for Kanban and Skills" };
+    if (!signInRequired) throw { kind: "unauthorized", message: "Sign-in is required on the Dashboard for Kanban, Skills, and MCP servers" };
     await reauth("sign-in", "The dashboard rejected your sign-in.");
     return await invoke<T>(cmd, args);
   }
@@ -1405,6 +1405,94 @@ function skillsView(): View {
   }
 
   const el = h("div", { className: "skills", hidden: true }, h("aside", { className: "panel" }, search, error, list), detail);
+  return { el, show: load };
+}
+
+// ---- MCP servers ----
+
+type McpServer = {
+  name: string; transport: string; url: string | null; command: string | null; args: string[]; env: string[];
+  auth: string | null; enabled: boolean; tools: string; source: string; plugin: string | null;
+};
+type McpTest = { ok: boolean; error: string | null; tools: { name: string; description: string | null }[]; prompts: number | null; resources: number | null };
+
+const mcpSource = (s: McpServer) => (s.source === "plugin" ? `plugin ${s.plugin ?? ""}`.trim() : "config");
+
+/** Read-only: the active Profile's MCP servers, and a live Test that lists one's tools. */
+function mcpView(): View {
+  let servers: McpServer[] = [];
+  let chosen: string | null = null;
+  const list = h("div", { className: "skill-list" });
+  const error = h("p", { className: "error" });
+  const placeholder = h("p", { className: "empty", textContent: "Pick an MCP server to see how it's set up." });
+  const detail = h("main", { className: "skill-detail" }, placeholder);
+
+  function render() {
+    list.replaceChildren(...servers.map((s) => {
+      const row = h("div", { className: "skill-row", tabIndex: 0, onclick: () => choose(s), onkeydown: (e) => e.key === "Enter" && choose(s) },
+        h("span", { className: "name", textContent: s.name }),
+        h("span", { className: "desc", textContent: `${s.transport} · ${s.enabled ? "enabled" : "disabled"} · ${mcpSource(s)}` }));
+      row.classList.toggle("disabled", !s.enabled);
+      row.classList.toggle("current", s.name === chosen);
+      return row;
+    }));
+    if (!servers.length && !error.textContent) list.append(h("p", { className: "muted", textContent: "This profile has no MCP servers." }));
+  }
+
+  function choose(s: McpServer) {
+    chosen = s.name;
+    render();
+    const fact = (label: string, value: string, code = false) => [h("dt", { textContent: label }), h("dd", { className: code ? "plain" : "", textContent: value })];
+    const facts = h("dl", { className: "mcp-facts" },
+      ...fact("Transport", s.transport),
+      ...(s.url ? fact("URL", s.url, true) : []),
+      ...(s.command ? fact("Command", [s.command, ...s.args].join(" "), true) : []),
+      ...(s.env.length ? fact("Environment", `${s.env.join(", ")} (values hidden)`) : []),
+      ...fact("Auth", s.auth ?? "none"),
+      ...fact("Tools Hermes uses", s.tools),
+      ...fact("Source", mcpSource(s)));
+    const result = h("div", { className: "mcp-result" });
+    const test = h("button", { className: "secondary", textContent: "Test", title: "Connect to this MCP server and list its tools" });
+    test.onclick = async () => {
+      test.disabled = true;
+      result.replaceChildren(h("p", { className: "muted", textContent: "Connecting…" }));
+      try {
+        const r = await call<McpTest>("mcp_test", { name: s.name });
+        if (chosen !== s.name) return;
+        const count = (n: number, what: string) => `${n} ${what}${n === 1 ? "" : "s"}`;
+        result.replaceChildren(...(r.ok
+          ? [h("p", { className: "muted", textContent: `Connected. It offers ${count(r.tools.length, "tool")}${r.prompts === null || r.resources === null ? "" : `, ${count(r.prompts, "prompt")}, and ${count(r.resources, "resource")}`}.` }),
+             h("ul", { className: "mcp-tools" }, ...r.tools.map((t) => h("li", {}, h("span", { className: "name", textContent: t.name }), h("span", { className: "muted", textContent: t.description ?? "" }))))]
+          : [h("p", { className: "error", textContent: `Test failed: ${r.error ?? "unknown error"}` })]));
+      } catch (e) {
+        if (chosen === s.name) result.replaceChildren(h("p", { className: "error", textContent: `Couldn't test ${s.name}: ${asError(e).message}` }));
+      } finally {
+        test.disabled = false;
+      }
+    };
+    detail.replaceChildren(
+      h("div", { className: "row skill-head" }, h("h2", { textContent: s.name }), h("span", { className: "muted", textContent: s.enabled ? "enabled" : "disabled" }), test),
+      facts, result);
+  }
+
+  async function load() {
+    try {
+      servers = await call<McpServer[]>("mcp_servers");
+      error.textContent = "";
+    } catch (e) {
+      servers = [];
+      error.textContent = `Couldn't load MCP servers: ${asError(e).message}`;
+    }
+    const again = servers.find((s) => s.name === chosen);
+    if (again) choose(again);
+    else {
+      chosen = null;
+      detail.replaceChildren(placeholder);
+      render();
+    }
+  }
+
+  const el = h("div", { className: "skills", hidden: true }, h("aside", { className: "panel" }, h("h2", { textContent: "MCP servers" }), error, list), detail);
   return { el, show: load };
 }
 
