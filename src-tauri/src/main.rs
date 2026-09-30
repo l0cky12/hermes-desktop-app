@@ -167,6 +167,19 @@ impl AppState {
         self.dashboard(method, &[&["api", "plugins", "kanban"], path].concat(), query)
     }
 
+    /// Skills routes act on the current Profile (`?profile=`); none yet means the Dashboard's own.
+    fn skills(&self, method: Method, path: &[&str], query: &[(&str, &str)]) -> Result<RequestBuilder, Error> {
+        let profile = self.lock().profile.clone();
+        let query: Vec<_> = query.iter().copied().chain(profile.as_deref().map(|p| ("profile", p))).collect();
+        self.dashboard(method, &[&["api", "skills"], path].concat(), &query)
+    }
+
+    /// Over SSH: the host, and the Profile to run `hermes -p` as.
+    fn ssh_profile(&self) -> Option<(String, Option<String>)> {
+        let inner = self.lock();
+        Some((inner.ssh_host.clone()?, inner.profile.clone()))
+    }
+
     /// The SSH connection to Hermes, (re)started on demand.
     async fn hermes(&self) -> Result<Arc<acp::Conn>, Error> {
         let mut slot = self.hermes.lock().await;
@@ -821,39 +834,39 @@ async fn kanban_dispatch(state: State<'_, AppState>, dry_run: bool) -> Result<Va
 
 #[tauri::command]
 async fn skills_list(state: State<'_, AppState>) -> Result<Vec<work::Skill>, Error> {
-    if let Some(host) = state.ssh_host() {
-        let (skills, paths) = work::skills_from_ssh(&remote::run(&host, remote::skills_list()).await?);
+    if let Some((host, profile)) = state.ssh_profile() {
+        let (skills, paths) = work::skills_from_ssh(&remote::run(&host, remote::skills_list(profile.as_deref())).await?);
         *state.skill_paths.lock().unwrap() = paths;
         return Ok(skills);
     }
-    Ok(work::skills_from_dashboard(state.dashboard_json(state.dashboard(Method::GET, &["api", "skills"], &[])?).await?))
+    Ok(work::skills_from_dashboard(state.dashboard_json(state.skills(Method::GET, &[], &[])?).await?))
 }
 
 /// The Skill's raw SKILL.md.
 #[tauri::command]
 async fn skill_content(state: State<'_, AppState>, name: String) -> Result<String, Error> {
-    if let Some(host) = state.ssh_host() {
+    if let Some((host, profile)) = state.ssh_profile() {
         let path = state.skill_paths.lock().unwrap().get(&name).cloned();
         let path = path.ok_or_else(|| Error::NotFound(format!("No skill named {name}")))?;
-        return remote::run(&host, remote::skill_content(&path)).await;
+        return remote::run(&host, remote::skill_content(profile.as_deref(), &path)).await;
     }
-    let request = state.dashboard(Method::GET, &["api", "skills", "content"], &[("name", &name)])?;
+    let request = state.skills(Method::GET, &["content"], &[("name", &name)])?;
     Ok(state.dashboard_json(request).await?["content"].as_str().unwrap_or_default().to_owned())
 }
 
-/// Enables or disables a Skill for the active Profile on every platform.
+/// Enables or disables a Skill for the current Profile on every platform.
 #[tauri::command]
 async fn skill_toggle(state: State<'_, AppState>, name: String, enabled: bool) -> Result<(), Error> {
     if work::is_essential(&name) {
         return Err(Error::Invalid(format!("{name} is essential and can't be disabled")));
     }
-    let Some(host) = state.ssh_host() else {
-        let request = state.dashboard(Method::PUT, &["api", "skills", "toggle"], &[])?.json(&json!({ "name": name, "enabled": enabled }));
+    let Some((host, profile)) = state.ssh_profile() else {
+        let request = state.skills(Method::PUT, &["toggle"], &[])?.json(&json!({ "name": name, "enabled": enabled }));
         return state.dashboard_json(request).await.map(drop);
     };
     // ponytail: read-modify-write; a toggle from another client in between is lost. Fine for one user.
     // An unreadable answer must stop here: writing back a guessed list would re-enable every other Skill.
-    let current = remote::json(&remote::run(&host, remote::skills_disabled()).await?)?;
+    let current = remote::json(&remote::run(&host, remote::skills_disabled(profile.as_deref())).await?)?;
     let mut disabled: Vec<String> = match current {
         Value::Null => Vec::new(),
         list => serde_json::from_value(list).map_err(|e| Error::Http(format!("Unreadable skills.disabled: {e}")))?,
@@ -862,7 +875,7 @@ async fn skill_toggle(state: State<'_, AppState>, name: String, enabled: bool) -
     if !enabled {
         disabled.push(name);
     }
-    remote::run(&host, remote::skills_set_disabled(&disabled)).await.map(drop)
+    remote::run(&host, remote::skills_set_disabled(profile.as_deref(), &disabled)).await.map(drop)
 }
 
 /// The Client log so far; new lines arrive on `on_line`.
@@ -971,6 +984,34 @@ mod tests {
         inner.profile = Some("coder".into());
         assert_eq!(inner.replace_key(None), Some("c".into()), "rollback of a rejected key");
         assert_eq!(inner.creds.api_key.as_deref(), Some("root"));
+    }
+
+    fn state_as(profile: Option<&str>, ssh_host: Option<&str>) -> AppState {
+        let gateway = Gateway { dashboard: Url::parse("http://h:9119/").unwrap(), api: Url::parse("http://h:8642/").unwrap() };
+        let inner = Inner { gateway: Some(gateway), ssh_host: ssh_host.map(Into::into), profile: profile.map(Into::into), ..Inner::default() };
+        AppState {
+            client: reqwest::Client::new(),
+            slow_client: reqwest::Client::new(),
+            settings_path: PathBuf::new(),
+            inner: Mutex::new(inner),
+            streams: Mutex::default(),
+            dropped: Mutex::default(),
+            hermes: tokio::sync::Mutex::default(),
+            acp_runs: Mutex::default(),
+            skill_paths: Mutex::default(),
+        }
+    }
+
+    #[test]
+    fn skills_follow_the_current_profile() {
+        let url = |profile: Option<&str>, path: &[&str], query: &[(&str, &str)]| {
+            state_as(profile, None).skills(Method::GET, path, query).unwrap().build().unwrap().url().to_string()
+        };
+        assert_eq!(url(Some("coder"), &[], &[]), "http://h:9119/api/skills?profile=coder");
+        assert_eq!(url(Some("default"), &["content"], &[("name", "unslop")]), "http://h:9119/api/skills/content?name=unslop&profile=default");
+        assert_eq!(url(None, &["toggle"], &[]), "http://h:9119/api/skills/toggle", "no Profile yet: the Dashboard's own");
+        assert_eq!(state_as(Some("coder"), Some("box")).ssh_profile(), Some(("box".into(), Some("coder".into()))));
+        assert_eq!(state_as(Some("coder"), None).ssh_profile(), None);
     }
 
     #[test]

@@ -1353,7 +1353,9 @@ function skillsView(): View {
   const search = input({ type: "search", placeholder: "Search skills…", required: false });
   const list = h("div", { className: "skill-list" });
   const error = h("p", { className: "error" });
-  const detail = h("main", { className: "skill-detail" }, h("p", { className: "empty", textContent: "Pick a skill to read its SKILL.md." }));
+  const pick = h("p", { className: "empty", textContent: "Pick a skill to read its SKILL.md." });
+  const detail = h("main", { className: "skill-detail" }, pick);
+  const whose = h("span", { className: "badge" }); // the Profile picked in Chat, whose Skills these are
   search.oninput = render;
 
   function toggle(skill: Skill, errorEl: HTMLElement): HTMLInputElement {
@@ -1429,16 +1431,30 @@ function skillsView(): View {
   }
 
   async function load() {
+    if (whose.textContent !== profile) {
+      // Another Profile since last shown: none of the previous one's Skills may linger.
+      whose.textContent = profile;
+      whose.title = `Skills of the ${profile} profile. Pick another profile under the message box in Chat.`;
+      skills = [];
+      chosen = null;
+      detail.replaceChildren(pick);
+      render();
+    }
+    const asked = profile;
     try {
-      skills = await call<Skill[]>("skills_list");
+      const got = await call<Skill[]>("skills_list");
+      if (asked !== profile) return; // Profile changed while listing: that answer is stale.
+      skills = got;
       error.textContent = "";
     } catch (e) {
+      if (asked !== profile) return;
       error.textContent = `Couldn't load skills: ${asError(e).message}`;
     }
     render();
   }
 
-  const el = h("div", { className: "skills", hidden: true }, h("aside", { className: "panel" }, search, error, list), detail);
+  const el = h("div", { className: "skills", hidden: true }, h("aside", { className: "panel" },
+    h("div", { className: "row" }, h("h2", { textContent: "Skills" }), whose), search, error, list), detail);
   return { el, show: load };
 }
 
