@@ -86,6 +86,14 @@ pub fn json(stdout: &str) -> Result<Value, Error> {
         .ok_or_else(|| Error::Http("hermes printed no readable JSON".into()))
 }
 
+/// `hermes -p <profile> usage --json`: the Remaining limit of the Profile's provider account.
+/// `-p` goes before the subcommand, which `hermes()` can't do. `profile` has passed
+/// `picker::valid_profile`; `None` is the Gateway's default Profile.
+pub fn usage(profile: Option<&str>) -> Cmd {
+    let profile = profile.map(|p| format!("-p {} ", quote(p))).unwrap_or_default();
+    Cmd { summary: "hermes usage", script: format!("exec hermes {profile}usage --json"), stdin: None }
+}
+
 /// POSIX single-quoting: the shell passes the result through as exactly one literal argument.
 pub fn quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
@@ -191,6 +199,21 @@ mod tests {
         let out = std::process::Command::new("sh").arg("-c").arg(cmd.remote_line()).env("HOME", &home).output().unwrap();
         let text = String::from_utf8(out.stdout).unwrap();
         text.split_terminator('\0').map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn usage_runs_for_the_chosen_profile() {
+        assert_eq!(argv_seen_by_hermes(&usage(Some("coder"))), ["-p", "coder", "usage", "--json"]);
+        assert_eq!(argv_seen_by_hermes(&usage(None)), ["usage", "--json"]);
+    }
+
+    /// Read-only, but asks the provider. Needs a working local `hermes`:
+    /// `HERMES_DESKTOP_SSH=$PWD/../mock/fake-ssh cargo test -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn reads_the_remaining_limit_from_real_hermes() {
+        let limit = crate::usage::limit(json(&run("localhost", usage(None)).await.unwrap()).unwrap()).unwrap();
+        assert!(!limit.provider.is_empty());
     }
 
     #[test]

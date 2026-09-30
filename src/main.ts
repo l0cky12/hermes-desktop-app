@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { field, h, icon, input } from "./dom";
+import { dollars, percentLeft, tokens } from "./usage-format";
 import { appearanceTab, applyAppearance } from "./appearance";
 import {
   changeLabel, choiceKey, DEFAULT_CHOICE, loadChoice, REASONING_LEVELS, saveChoice, saveProfile, startProfile,
@@ -996,9 +997,9 @@ document.addEventListener("pointerdown", (e) => {
 // ---- Shell: icon rail and views ----
 
 type View = { el: HTMLElement; show?: () => void; hide?: () => void };
-type ViewName = "chat" | "kanban" | "skills" | "logs";
+type ViewName = "chat" | "kanban" | "skills" | "usage" | "logs";
 
-const LABELS: Record<ViewName, string> = { chat: "Chat", kanban: "Kanban", skills: "Skills", logs: "Logs" };
+const LABELS: Record<ViewName, string> = { chat: "Chat", kanban: "Kanban", skills: "Skills", usage: "Usage", logs: "Logs" };
 
 let current: View | null = null;
 
@@ -1008,10 +1009,10 @@ document.addEventListener("keydown", (e) => {
   for (const drawer of document.querySelectorAll<HTMLElement>(".drawer")) drawer.hidden = true;
 });
 
-/** Replaces the app with the rail and its four views; Chat is shown first. */
+/** Replaces the app with the rail and its views; Chat is shown first. */
 function mountShell(chat: HTMLElement) {
   current?.hide?.();
-  const views: Record<ViewName, View> = { chat: { el: chat }, kanban: kanbanView(), skills: skillsView(), logs: logsView() };
+  const views: Record<ViewName, View> = { chat: { el: chat }, kanban: kanbanView(), skills: skillsView(), usage: usageView(), logs: logsView() };
   const buttons = (Object.keys(views) as ViewName[]).map((name) => {
     const button = h("button", { className: "rail-item", title: LABELS[name], onclick: () => select(name) });
     button.setAttribute("aria-label", LABELS[name]);
@@ -1460,6 +1461,128 @@ function logsView(): View {
     h("p", { className: "muted", textContent: "What this app did while talking to Hermes: requests, commands, and connection events. Never message content or secrets." }),
     out);
   return { el, show: () => (out.scrollTop = out.scrollHeight) };
+}
+
+// ---- Usage ----
+
+type Tally = { input_tokens: number; output_tokens: number; cache_read_tokens: number; estimated_cost: number; sessions: number };
+type Analytics = { daily: ({ day: string } & Tally)[]; totals: Tally; side_calls: Tally };
+type LimitWindow = { label: string; used_percent: number | null; resets_at: string | null; detail: string | null };
+type Limit = { provider: string; title: string | null; plan: string | null; fetched_at: string | null; windows: LimitWindow[]; details: string[]; unavailable_reason: string | null };
+
+/** Range label and analytics days; 0 is the past hour, which the analytics route can't count. */
+const RANGES: [string, number][] = [["Past hour", 0], ["24 hours", 1], ["7 days", 7], ["30 days", 30]];
+const NO_USAGE: Tally = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, estimated_cost: 0, sessions: 0 };
+
+/** The active Profile's spend and tokens over a range (HTTP), and its provider's Remaining limit (SSH). */
+function usageView(): View {
+  let days = 1;
+  let limitAsked = 0; // the newest loadLimit; an older, slower answer is dropped
+  const chips = h("div", { className: "chips" });
+  const note = h("p", { className: "muted" });
+  const stats = h("div", { className: "stats" });
+  const daily = h("table", { className: "daily" });
+  const dailyNote = h("p", { className: "muted", textContent: "Per day counts main agent calls only; side calls (compression, titles, vision) are in the totals above." });
+  const error = h("p", { className: "error" });
+  const limit = h("section", { className: "limit" });
+
+  const stat = (label: string, value: string, exact: string, sub = "") =>
+    h("div", { className: "stat", title: exact }, h("span", { className: "muted", textContent: label }),
+      h("strong", { textContent: value }), ...(sub ? [h("span", { className: "muted", textContent: sub })] : []));
+  const count = (n: number) => n.toLocaleString("en-US");
+
+  function render({ daily: perDay, totals, side_calls: side }: Analytics) {
+    const sideCost = side.estimated_cost > 0 ? `, incl. ${dollars(side.estimated_cost)} side calls` : "";
+    stats.replaceChildren(
+      stat("Spend", dollars(totals.estimated_cost), `$${+totals.estimated_cost.toFixed(6)}`, `Hermes's estimate${sideCost}`),
+      stat("Tokens in", tokens(totals.input_tokens), count(totals.input_tokens),
+        totals.cache_read_tokens > 0 ? `+ ${tokens(totals.cache_read_tokens)} read from cache` : ""),
+      stat("Tokens out", tokens(totals.output_tokens), count(totals.output_tokens)),
+      stat("Sessions", count(totals.sessions), count(totals.sessions)),
+    );
+    const table = days >= 7 && perDay.length > 0;
+    daily.replaceChildren(...(table ? [
+      h("tr", {}, ...["Day", "Spend", "In", "Out", "Sessions"].map((c) => h("th", { textContent: c }))),
+      ...[...perDay].reverse().map((d) => h("tr", {}, ...[d.day, dollars(d.estimated_cost), tokens(d.input_tokens), tokens(d.output_tokens), count(d.sessions)]
+        .map((c) => h("td", { textContent: c })))),
+    ] : []));
+    dailyNote.hidden = !table || !(side.input_tokens || side.output_tokens);
+  }
+
+  async function loadHistory() {
+    const asked = days;
+    chips.replaceChildren(...RANGES.map(([label, d]) => {
+      const b = h("button", { className: "chip-button", textContent: label, onclick: () => ((days = d), loadHistory()) });
+      b.setAttribute("aria-pressed", String(d === days));
+      return b;
+    }));
+    const range = RANGES.find(([, d]) => d === days)![0].toLowerCase();
+    note.textContent = `Sessions of the ${profile} profile started in the ${days ? "past " : ""}${range}, with all they used so far. ` +
+      `Spend is Hermes's estimate from its price list.${days ? "" : " Side calls (compression, titles, vision) aren't counted for the past hour."}`;
+    error.textContent = "";
+    try {
+      const data = days ? await call<Analytics>("usage_analytics", { days })
+        : { daily: [], totals: await invoke<Tally>("usage_past_hour"), side_calls: NO_USAGE };
+      if (asked === days) render(data);
+    } catch (e) {
+      if (asked !== days) return;
+      stats.replaceChildren();
+      daily.replaceChildren();
+      dailyNote.hidden = true;
+      error.textContent = `Couldn't load usage: ${asError(e).message}`;
+    }
+  }
+
+  async function loadLimit() {
+    const head = h("h2", { textContent: "Remaining limit" });
+    const muted = (text: string) => h("p", { className: "muted", textContent: text });
+    if (!overSsh) {
+      return limit.replaceChildren(head,
+        muted("Hermes reports this only to hermes usage on its host, not to the Dashboard or API server. Connect over SSH to see it here."));
+    }
+    limit.replaceChildren(head, muted("Asking the provider…"));
+    const asked = ++limitAsked;
+    let account: Limit;
+    try {
+      account = await invoke<Limit>("usage_limit");
+    } catch (e) {
+      if (asked !== limitAsked) return;
+      return limit.replaceChildren(head, h("p", { className: "error", textContent: `Couldn't read the limit: ${asError(e).message}` }));
+    }
+    if (asked !== limitAsked) return;
+    limit.replaceChildren(head,
+      muted([account.title ?? "Account limits", account.provider, account.plan].filter(Boolean).join(" · ")),
+      ...account.windows.map((w) => {
+        const left = w.used_percent === null ? null : percentLeft(w.used_percent);
+        const meter = h("meter", { min: 0, max: 100, value: left ?? 0 });
+        meter.setAttribute("aria-label", `${w.label} left`);
+        const parts = [left === null ? "" : `${left}% left`, w.detail ?? "", w.resets_at ? `resets ${new Date(w.resets_at).toLocaleString()}` : ""];
+        return h("div", { className: "window" }, h("strong", { textContent: w.label }), ...(left === null ? [] : [meter]),
+          muted(parts.filter(Boolean).join(" · ")));
+      }),
+      ...account.details.map((d) => h("p", { textContent: d })),
+      ...(account.unavailable_reason ? [h("p", { className: "error", textContent: account.unavailable_reason })] : []),
+      ...(account.fetched_at ? [muted(`Checked ${new Date(account.fetched_at).toLocaleString()}`)] : []));
+  }
+
+  function load() {
+    if (!overSsh) void loadHistory();
+    void loadLimit();
+  }
+
+  const refresh = h("button", { className: "link", textContent: "↻", title: "Refresh", onclick: load });
+  refresh.setAttribute("aria-label", "Refresh");
+  const history = h("section", {}, chips, note, error, stats, daily, dailyNote);
+  const sshNote = h("p", { className: "muted", textContent: "Over SSH, Hermes prints spend and token history only as text (hermes insights), so only the Remaining limit is shown." });
+  const el = h("div", { className: "usage", hidden: true }, h("div", { className: "row" }, h("h2", { textContent: "Usage" }), refresh), history, sshNote, limit);
+  return {
+    el,
+    show() {
+      history.hidden = overSsh;
+      sshNote.hidden = !overSsh;
+      load();
+    },
+  };
 }
 
 boot();

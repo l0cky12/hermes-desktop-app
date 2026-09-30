@@ -131,3 +131,13 @@ _Avoid_: plugin, tool, prompt
 **Client log**:
 This client's own record of what it did while talking to Hermes (requests with method, path, and status; connection events; warnings). Never contains message content or secrets. Distinct from Hermes's server logs.
 _Avoid_: logs (unqualified), server log
+
+### Usage
+
+**Side call**:
+A model call Hermes makes around a Session's Turns rather than for them (compression, titles, vision), counted toward spend and tokens but not toward the Session's own totals.
+_Avoid_: auxiliary call, aux usage
+
+**Remaining limit**:
+How much of the provider account limits behind a Profile (rate-limit windows, credits) is left, as the provider reports it to `hermes usage`.
+_Avoid_: quota, balance

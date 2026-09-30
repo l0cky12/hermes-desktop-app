@@ -81,6 +81,15 @@ The microphone records until you click it again, or for up to 2 minutes. The Das
 
 The dev mock (`node mock/server.mjs`) serves a small Board and Skills list too; `MOCK_KANBAN=off` answers like a Hermes with the Kanban plugin disabled.
 
+## Usage
+
+The **Usage** view (chart icon) covers the active Profile only.
+
+- **Spend and tokens:** spend in dollars (Hermes's estimate from its price list), tokens in and out, and the Session count for the past hour, 24 hours, 7 days, or 30 days, with a per-day table for 7 and 30 days. Sessions count by when they started, with everything they've used so far. Over HTTP this reads the Dashboard's `GET /api/analytics/usage`, and the totals include side calls (compression, titles, vision), which Hermes counts per task rather than per day. The past hour isn't a whole day, so that range sums the API server's Session records instead: the newest 200, without side calls. Over SSH none of this is shown, because Hermes prints that history only as text (`hermes insights`).
+- **Remaining limit:** how much of the provider account's rate-limit or credit windows is left, for the Profile's configured provider, from `hermes -p <profile> usage --json` on the host. It's shown over SSH only, because the Dashboard and API server don't report it.
+
+The mock's `GET /api/analytics/usage` sums its Sessions, and a fresh mock state seeds a few Sessions with usage. `(cd src-tauri && HERMES_DESKTOP_SSH=$PWD/../mock/fake-ssh cargo test -- --ignored)` also reads the real `hermes usage` (it asks the provider).
+
 ## Where things are stored
 
 - `~/.config/local.hermes-desktop/settings.json` holds the two gateway URLs, or the SSH host. It never holds secrets.

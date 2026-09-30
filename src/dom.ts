@@ -33,6 +33,7 @@ const ICONS = {
   kanban: '<path d="M3 3h18v18H3z M9 3v18 M15 3v18"/>',
   skills: '<path d="M12 2 2 7l10 5 10-5-10-5z M2 17l10 5 10-5 M2 12l10 5 10-5"/>',
   logs: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6 M16 13H8 M16 17H8 M10 9H8"/>',
+  usage: '<path d="M3 3v16a2 2 0 0 0 2 2h16 M18 17V9 M13 17V5 M8 17v-3"/>',
 };
 export type IconName = keyof typeof ICONS;
 
