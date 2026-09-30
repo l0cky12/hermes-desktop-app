@@ -114,6 +114,7 @@ The API server has no upload endpoint, so Attachments ride inside the Run reques
 - All of a Turn's Attachments together may total 7 MB: the API server refuses requests over 10 MB, and images grow by a third when base64-encoded. SSH gets the same budget.
 - Images (dropped, picked, or pasted) that don't fit what's left of the budget, or are in a format that can't be sent, are re-encoded as JPEG and scaled down until they fit.
 - Other file types, and text files that don't fit the budget, are refused with an inline error ("Not attached" when added, or "Not sent" for a dropped file, which is only measured when the Turn is sent).
+- Screenshots and other raw clipboard images paste too; on Linux the app reads them from the system clipboard as PNG, since the webview can't.
 
 ## Testing against the mock gateway
 

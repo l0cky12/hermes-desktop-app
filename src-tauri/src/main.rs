@@ -1004,6 +1004,35 @@ fn clear_client_log() {
     log::clear();
 }
 
+/// The bytes, if they are a PNG. The app holding the clipboard can answer with other content:
+/// xclip sends whatever it holds for any target.
+#[cfg(any(target_os = "linux", test))]
+fn only_png(bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { bytes } else { Vec::new() }
+}
+
+/// The clipboard's PNG, for a paste whose clipboardData held no image: WebKitGTK hides raw images
+/// such as screenshots from the page (the macOS and Windows webviews don't). Empty when there is none.
+/// Raw bytes, since a screenshot as JSON numbers would be tens of MB.
+#[tauri::command]
+async fn clipboard_image(app: tauri::AppHandle) -> Result<tauri::ipc::Response, Error> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    // GTK's own clipboard, on the main thread it belongs to: it follows the window's X11 or Wayland
+    // display and handles large (INCR) transfers such as `xclip` sends.
+    // ponytail: PNG only, which screenshot tools and browsers offer; request_image if an app offers only JPEG or BMP.
+    #[cfg(target_os = "linux")]
+    app.run_on_main_thread(move || {
+        use gtk::gdk::{Atom, SELECTION_CLIPBOARD};
+        gtk::Clipboard::get(&SELECTION_CLIPBOARD).request_contents(&Atom::intern("image/png"), move |_, data| {
+            let _ = tx.send(if data.length() > 0 { only_png(data.data()) } else { Vec::new() });
+        });
+    })
+    .map_err(|e| Error::Invalid(format!("the clipboard couldn't be read ({e})")))?;
+    #[cfg(not(target_os = "linux"))]
+    drop((app, tx));
+    Ok(tauri::ipc::Response::new(rx.await.unwrap_or_default()))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1086,6 +1115,7 @@ fn main() {
             skill_toggle,
             client_log,
             clear_client_log,
+            clipboard_image,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hermes Desktop");
@@ -1094,6 +1124,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clipboard_image_is_only_ever_a_png() {
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        assert_eq!(only_png(png.clone()), png);
+        assert!(only_png(b"<b>bold</b>".to_vec()).is_empty()); // xclip -t text/html, asked for image/png
+        assert!(only_png(Vec::new()).is_empty());
+    }
 
     #[test]
     fn each_profile_keeps_its_own_key() {
