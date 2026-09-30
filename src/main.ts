@@ -399,8 +399,11 @@ function showChat(supported: boolean, ssh = false) {
   ui.modelPicker.append(h("button", { type: "button", className: "icon-btn", title: "Model", onclick: toggleModelMenu }, icon("cpu"), ui.modelLabel, icon("chevron", 12)));
   const reasoningPicker = h("span", { className: "picker", title: "Reasoning level" }, icon("brain"), ui.reasoning);
   if (overSsh) {
+    // Hermes ACP has no per-Session reasoning, and `hermes config set` would change the Profile for everyone.
     ui.reasoning.disabled = true;
-    reasoningPicker.title = "Over SSH, the reasoning level is set in the profile's config";
+    ui.reasoning.options[0].textContent = "Profile config";
+    reasoningPicker.title = ui.reasoning.title =
+      "Over SSH, Hermes can't set a Reasoning level per Session. Runs use agent.reasoning_effort from the Profile's config.";
   }
   ui.reasoning.onchange = () => setChoice({ ...choice, reasoning: ui!.reasoning.value || null });
   ui.toolbar.insertBefore(ui.modelPicker, ui.spacer);

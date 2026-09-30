@@ -28,6 +28,8 @@ test("choices are kept per connection, Profile, and Session", () => {
   saveChoice(store, a, { model: { provider: "zai", model: "glm-5.3-flash" }, reasoning: "high" });
   assert.deepEqual(loadChoice(store, a), { model: { provider: "zai", model: "glm-5.3-flash" }, reasoning: "high" });
   assert.deepEqual(loadChoice(store, b), DEFAULT_CHOICE);
+  saveChoice(store, b, { model: null, reasoning: "ultra" }); // the top of the gateway's ladder
+  assert.deepEqual(loadChoice(store, b), { model: null, reasoning: "ultra" });
   store.setItem(a, JSON.stringify({ model: { provider: 1 }, reasoning: "turbo" }));
   assert.deepEqual(loadChoice(store, a), DEFAULT_CHOICE);
 });

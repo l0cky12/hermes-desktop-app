@@ -71,7 +71,7 @@ The bar under the message box picks the **Profile** (person icon), model (CPU ic
 - Over SSH, switching restarts Hermes as `hermes -p <name> acp`.
 - The model list shows only providers you've set up.
 - The model and Reasoning level belong to each Session, can change partway through it, and take effect from the next Turn. A small label marks the first reply after a change.
-- Over SSH, the Reasoning level comes from the Profile's config and can't be changed here.
+- Over SSH, the Reasoning level picker reads "Profile config" and is disabled: Hermes's `hermes acp` has no per-Session Reasoning level, so Runs use `agent.reasoning_effort` from the Profile's config.
 
 The copy icon in the same bar copies the open Session to the clipboard as Markdown: every Turn's message and reply under **User** and **Hermes** headings, Attachments and tools listed by name. It's greyed out until the Session has a Turn.
 
@@ -129,6 +129,7 @@ Headless run with a throwaway keyring:
 
 ```sh
 Xvfb :121 -screen 0 1400x900x24 & export DISPLAY=:121
+export XDG_DATA_HOME=/tmp/hd/data XDG_CONFIG_HOME=/tmp/hd/config; mkdir -p $XDG_DATA_HOME $XDG_CONFIG_HOME  # keeps the throwaway keyring and settings out of your home
 export DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --session --fork --print-address=1)
 echo -n test | gnome-keyring-daemon --unlock --components=secrets --daemonize
 src-tauri/target/release/hermes-desktop
