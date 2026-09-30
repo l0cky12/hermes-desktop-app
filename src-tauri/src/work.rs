@@ -7,9 +7,11 @@ use std::collections::{HashMap, HashSet};
 /// Skills Hermes never lets anyone disable (`agent/skill_utils.py` ESSENTIAL_SKILLS).
 const ESSENTIAL: [&str; 1] = ["hermes-agent"];
 
-/// Separates `hermes config get skills.disabled --json` from the SKILL.md frontmatter that
-/// follows it in the SSH listing; each file's frontmatter starts with `@@@ <relative path>`.
+/// Separates `hermes config get skills.disabled --json` from what follows it in the SSH listing:
+/// the Profile home (`@@@home <dir>`), then each SKILL.md's frontmatter, starting with
+/// `@@@ <path under skills/>`.
 pub const SKILLS_MARK: &str = "@@@skills";
+pub const HOME_MARK: &str = "@@@home ";
 pub const FILE_MARK: &str = "@@@ ";
 
 /// The Task fields the client shows; the Dashboard and `hermes kanban … --json` name them alike.
@@ -107,10 +109,13 @@ pub fn skills_from_dashboard(body: Value) -> Vec<Skill> {
         .collect()
 }
 
-/// The SSH listing script's output: the Skills, and each one's SKILL.md path under the
-/// Profile's skills directory (for reading it later).
-pub fn skills_from_ssh(output: &str) -> (Vec<Skill>, HashMap<String, String>) {
-    let (disabled, files) = output.split_once(SKILLS_MARK).unwrap_or(("", output));
+/// The SSH listing script's output: the Skills, and each one's SKILL.md path (for reading it
+/// later). `None` if the output doesn't say which Profile home it listed.
+pub fn skills_from_ssh(output: &str) -> Option<(Vec<Skill>, HashMap<String, String>)> {
+    let (disabled, rest) = output.split_once(SKILLS_MARK)?;
+    let rest = rest.trim_start_matches('\n');
+    let (home, files) = rest.split_at(rest.find('\n').unwrap_or(rest.len()));
+    let home = home.strip_prefix(HOME_MARK)?;
     // Hermes may print chatter before the value; the JSON is the last line.
     let disabled: HashSet<String> =
         disabled.trim().lines().last().and_then(|l| serde_json::from_str(l).ok()).unwrap_or_default();
@@ -128,7 +133,7 @@ pub fn skills_from_ssh(output: &str) -> (Vec<Skill>, HashMap<String, String>) {
         if paths.contains_key(&name) {
             continue;
         }
-        paths.insert(name.clone(), path.to_owned());
+        paths.insert(name.clone(), format!("{home}/skills/{path}"));
         skills.push(Skill {
             enabled: !disabled.contains(&name) || is_essential(&name),
             essential: is_essential(&name),
@@ -137,7 +142,7 @@ pub fn skills_from_ssh(output: &str) -> (Vec<Skill>, HashMap<String, String>) {
             name,
         });
     }
-    (skills, paths)
+    Some((skills, paths))
 }
 
 /// Top-level `key: value` pairs of YAML frontmatter: plain, quoted, or `>`/`|` blocks
@@ -256,12 +261,12 @@ mod tests {
 
     #[test]
     fn ssh_listing_reads_frontmatter_category_and_disabled_state() {
-        let output = "hermes: chatter\n[\"codex\", \"hermes-agent\"]\n@@@skills\n\
+        let output = "hermes: chatter\n[\"codex\", \"hermes-agent\"]\n@@@skills\n@@@home /h/my profile\n\
             @@@ ./unslop/SKILL.md\nname: unslop\ndescription: Cut AI tells: all of them\n\
             @@@ ./autonomous-ai-agents/codex/SKILL.md\nname: \"codex\"\ndescription: 'Delegate coding'\nversion: 1\n\
             @@@ ./devops/ad-cs/SKILL.md\ndescription: >-\n  Request AD\n  certificates\ntags: [x]\n\
             @@@ ./autonomous-ai-agents/hermes-agent/SKILL.md\nname: hermes-agent\ndescription: |\n  Use Hermes\n";
-        let (skills, paths) = skills_from_ssh(output);
+        let (skills, paths) = skills_from_ssh(output).unwrap();
         assert_eq!(
             skills,
             [
@@ -271,13 +276,14 @@ mod tests {
                 skill("hermes-agent", "Use Hermes", Some("autonomous-ai-agents"), true, true),
             ]
         );
-        assert_eq!(paths["codex"], "autonomous-ai-agents/codex/SKILL.md");
+        assert_eq!(paths["codex"], "/h/my profile/skills/autonomous-ai-agents/codex/SKILL.md");
+        assert_eq!(skills_from_ssh("[]\n@@@skills\n@@@ ./a/SKILL.md\n@@@home /x\n"), None, "the home comes first");
     }
 
     #[test]
     fn ssh_listing_with_nothing_disabled_or_installed() {
-        assert!(skills_from_ssh("null\n@@@skills\n").0.is_empty());
-        let (skills, _) = skills_from_ssh("@@@skills\n@@@ ./a/SKILL.md\nname: a\n");
+        assert!(skills_from_ssh("null\n@@@skills\n@@@home /h\n").unwrap().0.is_empty());
+        let (skills, _) = skills_from_ssh("@@@skills\n@@@home /h\n@@@ ./a/SKILL.md\nname: a\n").unwrap();
         assert_eq!(skills, [skill("a", "", None, true, false)]);
     }
 }

@@ -169,28 +169,29 @@ pub fn sessions_rename(profile: Option<&str>, id: &str, title: &str) -> Cmd {
     hermes_as(profile, "hermes sessions rename", &["--".into(), id.into(), title.into()])
 }
 
-/// The disabled list, then every SKILL.md's frontmatter under the Profile's skills directory,
-/// skipping hidden directories as Hermes does (`.archive`, `.hub`, …). Parsed by
-/// `work::skills_from_ssh`.
+/// The disabled list, then the Profile home the listing used, then every SKILL.md's frontmatter
+/// under the Profile's skills directory, skipping hidden directories as Hermes does (`.archive`,
+/// `.hub`, …). Parsed by `work::skills_from_ssh`. Each `hermes` start-up costs about a second,
+/// so its two calls run side by side.
 // ponytail: only the Profile's own skills dir; add `skills.external_dirs` when someone uses them.
 pub fn skills_list(profile: Option<&str>) -> Cmd {
     let script = format!(
-        "{}; {} config get skills.disabled --json 2>/dev/null; printf '\\n{}\\n'; \
+        "{} config get skills.disabled --json 2>/dev/null & {}; wait; printf '\\n{}\\n{}%s\\n' \"$home\"; \
          cd \"$home/skills\" 2>/dev/null || exit 0; \
          exec find -L . -name SKILL.md ! -path '*/.*/*' -exec awk \
          'FNR==1 {{ print \"{}\" FILENAME; if ($0 !~ /^---/) nextfile; next }} /^---/ {{ nextfile }} {{ print }}' {{}} +",
-        profile_home(profile),
         bin(profile),
+        profile_home(profile),
         crate::work::SKILLS_MARK,
+        crate::work::HOME_MARK,
         crate::work::FILE_MARK,
     );
     Cmd { summary: "hermes skills (list)", script, stdin: None }
 }
 
-/// One SKILL.md, by the path `skills_list` reported for it.
-pub fn skill_content(profile: Option<&str>, path: &str) -> Cmd {
-    let script = format!("{}; exec cat -- \"$home/skills/\"{}", profile_home(profile), quote(path));
-    Cmd { summary: "hermes skills (read)", script, stdin: None }
+/// One SKILL.md, by the absolute path a listing reported for it.
+pub fn skill_content(path: &str) -> Cmd {
+    Cmd { summary: "hermes skills (read)", script: format!("exec cat -- {}", quote(path)), stdin: None }
 }
 
 pub fn skills_disabled(profile: Option<&str>) -> Cmd {
@@ -287,21 +288,26 @@ mod tests {
         }
         let bin = home.join(".local/bin");
         std::fs::create_dir_all(&bin).unwrap();
+        // Each `hermes` start-up costs about a second, so the fake takes one too; the disabled
+        // list comes last, yet must still be read as the disabled list.
         let fake = format!(
-            "#!/bin/sh\ncase \"$*\" in\n  '-p coder config path') echo {}/config.yaml ;;\n  '-p coder config get skills.disabled --json') echo '[\"unslop\"]' ;;\nesac\n",
+            "#!/bin/sh\ncase \"$*\" in\n  '-p coder config path') sleep 1; echo chatter; echo {}/config.yaml ;;\n  '-p coder config get skills.disabled --json') sleep 1.5; echo '[\"unslop\"]' ;;\nesac\n",
             profile.display()
         );
         std::fs::write(bin.join("hermes"), fake).unwrap();
         std::process::Command::new("chmod").arg("+x").arg(bin.join("hermes")).status().unwrap();
+        let started = std::time::Instant::now();
         let out = std::process::Command::new("sh").arg("-c").arg(skills_list(Some("coder")).remote_line()).env("HOME", &home).output().unwrap();
+        // One after the other takes at least 2.5 s.
+        assert!(started.elapsed() < std::time::Duration::from_millis(2400), "both hermes calls run side by side");
 
-        let (skills, paths) = crate::work::skills_from_ssh(&String::from_utf8(out.stdout).unwrap());
+        let (skills, paths) = crate::work::skills_from_ssh(&String::from_utf8(out.stdout).unwrap()).unwrap();
         let mut names: Vec<_> = skills.iter().map(|s| (s.name.as_str(), s.enabled, s.description.as_str())).collect();
         names.sort();
         assert_eq!(names, [("ad-cs", true, "Request certs"), ("no-frontmatter", true, ""), ("unslop", false, "Cut AI tells")]);
-        assert_eq!(paths["ad-cs"], "devops/ad-cs/SKILL.md");
+        assert_eq!(paths["ad-cs"], format!("{}/skills/devops/ad-cs/SKILL.md", profile.display()));
 
-        let out = std::process::Command::new("sh").arg("-c").arg(skill_content(Some("coder"), &paths["unslop"]).remote_line()).env("HOME", &home).output().unwrap();
+        let out = std::process::Command::new("sh").arg("-c").arg(skill_content(&paths["unslop"]).remote_line()).env("HOME", &home).output().unwrap();
         assert!(String::from_utf8(out.stdout).unwrap().ends_with("# Body\n---\n"));
     }
 
@@ -314,9 +320,9 @@ mod tests {
         let detail = crate::work::detail_from(json(&run("localhost", kanban_show(&first.id)).await.unwrap()).unwrap()).unwrap();
         assert_eq!(detail.task.id, first.id);
         assert!(!crate::work::assignee_names(json(&run("localhost", kanban_assignees()).await.unwrap()).unwrap()).is_empty());
-        let (skills, paths) = crate::work::skills_from_ssh(&run("localhost", skills_list(None)).await.unwrap());
+        let (skills, paths) = crate::work::skills_from_ssh(&run("localhost", skills_list(None)).await.unwrap()).unwrap();
         let skill = skills.iter().find(|s| !s.description.is_empty()).expect("a skill with a description");
-        assert!(run("localhost", skill_content(None, &paths[&skill.name])).await.unwrap().contains(&skill.name));
+        assert!(run("localhost", skill_content(&paths[&skill.name])).await.unwrap().contains(&skill.name));
     }
 
     #[test]

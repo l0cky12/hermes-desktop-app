@@ -1528,15 +1528,23 @@ function kanbanView(): View {
 
 type Skill = { name: string; description: string; category: string | null; enabled: boolean; essential: boolean };
 
+/** The last Skills list loaded this run, per connection and Profile, so re-opening Skills shows it at once. */
+const skillsCache = new Map<string, Skill[]>();
+
 function skillsView(): View {
+  let key = ""; // connection and Profile the list is for
   let skills: Skill[] = [];
   let chosen: string | null = null;
+  // A refresh that overlaps a toggle may predate its write, so it's dropped if a list is showing.
+  let settled = 0; // toggles finished
+  let pending = 0; // toggles in flight
+  let refreshes = 0; // only the latest refresh lands, so an older list can't overwrite a newer one
   const collapsed = new Set<string>();
   const search = input({ type: "search", placeholder: "Search skills…", required: false });
   const list = h("div", { className: "skill-list" });
   const error = h("p", { className: "error" });
-  const pick = h("p", { className: "empty", textContent: "Pick a skill to read its SKILL.md." });
-  const detail = h("main", { className: "skill-detail" }, pick);
+  const placeholder = h("p", { className: "empty", textContent: "Pick a skill to read its SKILL.md." });
+  const detail = h("main", { className: "skill-detail" }, placeholder);
   const whose = h("span", { className: "badge" }); // the Profile picked in Chat, whose Skills these are
   search.oninput = render;
 
@@ -1550,6 +1558,7 @@ function skillsView(): View {
       const enabled = box.checked;
       box.disabled = true;
       errorEl.textContent = "";
+      pending++;
       try {
         await call("skill_toggle", { name: skill.name, enabled });
         skill.enabled = enabled;
@@ -1557,6 +1566,8 @@ function skillsView(): View {
         box.checked = !enabled;
         errorEl.textContent = `Couldn't ${enabled ? "enable" : "disable"} ${skill.name}: ${asError(e).message}`;
       }
+      settled++;
+      pending--;
       render();
       if (chosen === skill.name) renderHeader();
     };
@@ -1591,7 +1602,14 @@ function skillsView(): View {
 
   function renderHeader() {
     const skill = skills.find((s) => s.name === chosen);
-    if (!skill) return;
+    if (!skill) {
+      // The chosen Skill is gone from the fresh list (uninstalled on the host).
+      if (chosen !== null) {
+        chosen = null;
+        detail.replaceChildren(placeholder);
+      }
+      return;
+    }
     header.replaceChildren(toggle(skill, detailError), h("h2", { textContent: skill.name }),
       h("span", { className: "muted", textContent: `${skill.category ?? "general"}${skill.essential ? " · essential" : ""}` }));
   }
@@ -1612,32 +1630,49 @@ function skillsView(): View {
     }
   }
 
-  async function load() {
-    if (whose.textContent !== profile) {
-      // Another Profile since last shown: none of the previous one's Skills may linger.
+  /** Shows the last list for this connection and Profile (or a loading line), then refreshes it. */
+  function show() {
+    const wanted = `${connection}|${profile}`;
+    if (wanted !== key) {
+      // Another Profile or host since last shown: none of the previous one's Skills may linger.
+      key = wanted;
       whose.textContent = profile;
       whose.title = `Skills of the ${profile} profile. Pick another profile under the message box in Chat.`;
-      skills = [];
       chosen = null;
-      detail.replaceChildren(pick);
-      render();
-    }
-    const asked = profile;
-    try {
-      const got = await call<Skill[]>("skills_list");
-      if (asked !== profile) return; // Profile changed while listing: that answer is stale.
-      skills = got;
       error.textContent = "";
+      detail.replaceChildren(placeholder);
+    }
+    skills = skillsCache.get(key) ?? [];
+    if (skillsCache.has(key)) render();
+    else list.replaceChildren(h("p", { className: "empty", textContent: "Loading skills…" }));
+    void refresh();
+  }
+
+  // `key` only changes in show(), which always starts a new refresh, so a ticket that is still
+  // current is always for the current key.
+  async function refresh() {
+    const seen = settled;
+    const ticket = ++refreshes;
+    try {
+      const fresh = await call<Skill[]>("skills_list");
+      if (ticket !== refreshes) return;
+      error.textContent = "";
+      if ((settled !== seen || pending) && skillsCache.has(key)) return;
+      // Unchanged: keep the shown rows (and the objects their switches update) rather than redraw.
+      if (JSON.stringify(skillsCache.get(key)) === JSON.stringify(fresh)) return;
+      skillsCache.set(key, fresh);
+      skills = fresh;
     } catch (e) {
-      if (asked !== profile) return;
+      if (ticket !== refreshes) return;
       error.textContent = `Couldn't load skills: ${asError(e).message}`;
     }
     render();
+    renderHeader();
   }
 
   const el = h("div", { className: "skills", hidden: true }, h("aside", { className: "panel" },
     h("div", { className: "row" }, h("h2", { textContent: "Skills" }), whose), search, error, list), detail);
-  return { el, show: load };
+  return { el, show };
 }
 
 // ---- Logs (Client log) ----
