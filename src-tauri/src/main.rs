@@ -822,7 +822,8 @@ async fn kanban_dispatch(state: State<'_, AppState>, dry_run: bool) -> Result<Va
 #[tauri::command]
 async fn skills_list(state: State<'_, AppState>) -> Result<Vec<work::Skill>, Error> {
     if let Some(host) = state.ssh_host() {
-        let (skills, paths) = work::skills_from_ssh(&remote::run(&host, remote::skills_list()).await?);
+        let output = remote::run(&host, remote::skills_list()).await?;
+        let (skills, paths) = work::skills_from_ssh(&output).ok_or_else(|| Error::Http("hermes printed no profile home".into()))?;
         *state.skill_paths.lock().unwrap() = paths;
         return Ok(skills);
     }

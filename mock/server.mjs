@@ -7,6 +7,7 @@
 // Prompt keywords script the reply: "tool" (tool events), "idle" (12 s silence, so a 10 s
 // keepalive fires mid-stream), "slow" (long, slow reply for kill tests), "approval", "fail".
 // MOCK_TRANSCRIBE_MS delays speech-to-text (try 20000 to outlast the 15 s idle timeout).
+// MOCK_SKILLS_MS delays the Skills list (try 2000, about what a listing over SSH takes).
 // Profiles: default (MOCK_KEY), orchestrator (hd-orch-key-7d3e9a1c5b), coder (no key).
 import http from "node:http";
 import { randomBytes } from "node:crypto";
@@ -136,6 +137,7 @@ serve(DASH_PORT, "dashboard", async (req, res, url) => {
     return send(res, 200, { ok: true, transcript: `hello from the mock microphone (${profileName})`, provider: "mock" });
   }
   if (url.pathname.startsWith("/api/plugins/kanban/") || url.pathname.startsWith("/api/skills")) {
+    if (route === "GET /api/skills") await new Promise((resolve) => setTimeout(resolve, Number(env.MOCK_SKILLS_MS ?? 0)));
     return work(req, res, url);
   }
   send(res, 404, { detail: "Not Found" });

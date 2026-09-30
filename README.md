@@ -76,10 +76,10 @@ The microphone records until you click it again, or for up to 2 minutes. The Das
 ## Kanban, Skills, and Logs
 
 - **Kanban** shows the default Board. Filter by text, Assignee, tenant, or status (click a stats chip). Create a Task from the "New task" box (Enter), or use **More…** for body, Assignee, priority, and tenant. Click a Task for its body and Comments. **Preview dispatcher** shows what one Dispatch would do; **Run dispatcher** runs one now (at most 8 spawns). Tasks are read-only apart from Comments.
-- **Skills** lists the active Profile's Skills by category. Click one to read its SKILL.md; the switch enables or disables it on every platform. Essential Skills (`hermes-agent`) can't be switched off. Over SSH, only the Profile's own `skills/` directory is listed, not `skills.external_dirs`.
+- **Skills** lists the active Profile's Skills by category. Re-opening it shows the last list at once (until the app quits) and refreshes it in the background. Click one to read its SKILL.md; the switch enables or disables it on every platform. Essential Skills (`hermes-agent`) can't be switched off. Over SSH, only the Profile's own `skills/` directory is listed, not `skills.external_dirs`.
 - **Logs** is the Client log (see below).
 
-The dev mock (`node mock/server.mjs`) serves a small Board and Skills list too; `MOCK_KANBAN=off` answers like a Hermes with the Kanban plugin disabled.
+The dev mock (`node mock/server.mjs`) serves a small Board and Skills list too; `MOCK_KANBAN=off` answers like a Hermes with the Kanban plugin disabled, and `MOCK_SKILLS_MS=2000` makes the Skills list as slow as over SSH.
 
 ## Where things are stored
 
