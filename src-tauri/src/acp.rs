@@ -63,6 +63,9 @@ pub struct Conn {
     models: Mutex<Option<Value>>,
     /// The model id each Session is on, as last reported by `session/new`/`session/load` or set here.
     current: Mutex<HashMap<String, String>>,
+    /// The last completed `session/prompt` usage per Session: Hermes reports running totals, so a
+    /// Turn's own usage is the difference from this.
+    usage: Mutex<HashMap<String, Value>>,
     _child: Child,
 }
 
@@ -107,6 +110,7 @@ pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Err
         cwds: Mutex::default(),
         models: Mutex::default(),
         current: Mutex::default(),
+        usage: Mutex::default(),
         _child: child,
     });
     tokio::spawn(read(conn.clone(), lines, stderr));
@@ -260,7 +264,18 @@ impl Conn {
         let Some(wanted) = model_switch(model, current.as_deref(), default.as_deref()) else { return Ok(()) };
         self.request("session/set_model", json!({ "sessionId": session, "modelId": wanted })).await?;
         self.current.lock().unwrap().insert(session.to_owned(), wanted);
+        // The switch rebuilds the Session's AIAgent in Hermes, which starts its usage totals from zero.
+        self.usage.lock().unwrap().remove(session);
         Ok(())
+    }
+
+    /// This Turn's usage from a completed `session/prompt` result, remembering its totals for the
+    /// next Turn.
+    // ponytail: a Stopped Turn's answer is never read, so its tokens count toward the next Turn.
+    pub fn turn_usage(&self, session: &str, result: &Value) -> Option<Value> {
+        let totals = result.get("usage").filter(|u| u.is_object())?.clone();
+        let before = self.usage.lock().unwrap().insert(session.to_owned(), totals.clone());
+        Some(usage_delta(&totals, before.as_ref()))
     }
 
     /// Routes a Session's updates to the returned receiver until `unsubscribe` or disconnect.
@@ -369,12 +384,33 @@ pub fn translate(update: &Value, tools: &mut HashMap<String, String>) -> Vec<Val
     }
 }
 
-/// The terminal Run event for a `session/prompt` result.
-pub fn finished(result: Result<Value, Error>) -> Value {
+/// ACP usage fields, and the API server's `usage` field each maps to.
+const USAGE_FIELDS: [(&str, &str); 3] =
+    [("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"), ("cachedReadTokens", "cache_read_tokens")];
+
+/// Hermes's ACP usage is the running totals of the Session's AIAgent, not the Turn's own (the ACP spec
+/// says per-Turn), so the Turn's usage is `totals - before`, in the API server's `run.completed` shape.
+/// Totals below `before` mean Hermes rebuilt the AIAgent (e.g. `/new`) and count from zero.
+/// Like the API server's, `inputTokens` includes cache reads and writes.
+// ponytail: a rebuild whose first Turn outgrows every old total reads as a small Turn; Hermes
+// sending per-Turn usage would fix it.
+pub fn usage_delta(totals: &Value, before: Option<&Value>) -> Value {
+    let count = |usage: &Value, key: &str| usage[key].as_u64().unwrap_or(0);
+    let before = before.filter(|b| USAGE_FIELDS.iter().all(|(k, _)| count(totals, k) >= count(b, k)));
+    let turn = USAGE_FIELDS.map(|(acp, http)| (http, count(totals, acp) - before.map_or(0, |b| count(b, acp))));
+    json!(serde_json::Map::from_iter(turn.map(|(k, v)| (k.to_owned(), json!(v)))))
+}
+
+/// The terminal Run event for a `session/prompt` result. `usage` (`Conn::turn_usage`) is read only
+/// for a completed Turn, so a Stopped or refused Turn's tokens count toward the next one.
+pub fn finished(result: Result<Value, Error>, usage: impl FnOnce(&Value) -> Option<Value>) -> Value {
     match result {
         Ok(r) if r["stopReason"] == "cancelled" => json!({ "event": "run.cancelled" }),
         Ok(r) if r["stopReason"] == "refusal" => json!({ "event": "run.failed", "error": "Hermes refused the prompt" }),
-        Ok(_) => json!({ "event": "run.completed" }),
+        Ok(r) => match usage(&r) {
+            Some(usage) => json!({ "event": "run.completed", "usage": usage }),
+            None => json!({ "event": "run.completed" }),
+        },
         Err(Error::Unreachable(m) | Error::Unauthorized(m) | Error::NotFound(m) | Error::Http(m) | Error::Invalid(m)) => {
             json!({ "event": "run.failed", "error": m })
         }
@@ -458,8 +494,26 @@ mod tests {
         // The permission bubble's own close has an id we never started.
         let perm = json!({ "sessionUpdate": "tool_call_update", "toolCallId": "perm-check-1", "status": "completed" });
         assert!(translate(&perm, &mut tools).is_empty());
-        assert_eq!(finished(Ok(json!({ "stopReason": "cancelled" })))["event"], "run.cancelled");
-        assert_eq!(finished(Ok(json!({ "stopReason": "end_turn" })))["event"], "run.completed");
+        assert_eq!(finished(Ok(json!({ "stopReason": "cancelled" })), |_| None)["event"], "run.cancelled");
+        assert_eq!(finished(Ok(json!({ "stopReason": "end_turn" })), |_| None), json!({ "event": "run.completed" }));
+    }
+
+    #[test]
+    fn turn_usage_is_the_change_in_session_totals() {
+        let totals = |i: u64, o: u64, c: u64| json!({ "inputTokens": i, "outputTokens": o, "totalTokens": i + o, "cachedReadTokens": c });
+        let turn = |i: u64, o: u64, c: u64| json!({ "input_tokens": i, "output_tokens": o, "cache_read_tokens": c });
+        assert_eq!(usage_delta(&totals(1000, 50, 0), None), turn(1000, 50, 0));
+        assert_eq!(usage_delta(&totals(2500, 80, 900), Some(&totals(1000, 50, 0))), turn(1500, 30, 900));
+        // A rebuilt AIAgent (model switch, /new) restarts its totals.
+        assert_eq!(usage_delta(&totals(700, 20, 0), Some(&totals(2500, 80, 900))), turn(700, 20, 0));
+        // Optional cache field missing (provider without cache accounting).
+        assert_eq!(usage_delta(&json!({ "inputTokens": 10, "outputTokens": 2, "totalTokens": 12 }), None), turn(10, 2, 0));
+        let done = finished(Ok(json!({ "stopReason": "end_turn" })), |_| Some(turn(1, 2, 0)));
+        assert_eq!(done, json!({ "event": "run.completed", "usage": turn(1, 2, 0) }));
+        // A Stopped or refused Turn's totals are left for the next Turn's difference, not dropped.
+        for reason in ["cancelled", "refusal"] {
+            finished(Ok(json!({ "stopReason": reason })), |_| panic!("read the usage of a {reason} Turn"));
+        }
     }
 
     #[test]

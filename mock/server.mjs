@@ -273,6 +273,8 @@ function touchSession(id, preview, profile = "default") {
   state.sessions[id] ??= {
     id, source: "api_server", profile, title: null, model: "mock", started_at: now(), ended_at: null,
     message_count: 0, tool_call_count: 0, parent_session_id: null, preview: null, pinned: false, archived: false,
+    input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0,
+    estimated_cost_usd: null, actual_cost_usd: null, api_call_count: 0, // Hermes starts cost at NULL
   };
   state.messages[id] ??= [];
   const session = state.sessions[id];
@@ -353,10 +355,22 @@ function startRun(runId, sessionId, prompt, attachments, via) {
     );
     if (run.stop) return emit("run.cancelled", { completed: false, partial: true, interrupted: true });
     addMessage(sessionId, "assistant", reply);
-    emit("run.completed", {
-      completed: true, partial: false, interrupted: false, output: reply,
-      usage: { input_tokens: 12, output_tokens: reply.split(" ").length, total_tokens: 12 + reply.split(" ").length },
-    });
+    // Like Hermes: the Run's input_tokens includes cache reads/writes, the Session record's excludes them.
+    // The earlier transcript is served from the prompt cache.
+    const session = state.sessions[sessionId];
+    const history = (state.messages[sessionId]?.length ?? 2) - 2;
+    const input = 1200 + 300 * history, output = reply.split(" ").length, cached = 300 * history;
+    const usage = { input_tokens: input, output_tokens: output, total_tokens: input + output, cache_read_tokens: cached, cache_write_tokens: 0 };
+    if (session) {
+      const add = (key, n) => (session[key] = (session[key] ?? 0) + n); // sessions saved by an older mock lack these
+      add("input_tokens", input - cached);
+      add("output_tokens", output);
+      add("cache_read_tokens", cached);
+      add("api_call_count", 1);
+      add("estimated_cost_usd", (3 * (input - cached) + 0.3 * cached + 15 * output) / 1e6);
+      save();
+    }
+    emit("run.completed", { completed: true, partial: false, interrupted: false, output: reply, usage });
   })();
 }
 
