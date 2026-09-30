@@ -82,6 +82,10 @@ _Avoid_: resend, regenerate
 Closing a Turn's event stream at once and asking the API server to stop its Run.
 _Avoid_: cancel, abort
 
+**Retitle**:
+Asking the model for a new Session title based on the transcript, which replaces the current title.
+_Avoid_: regenerate (that's for replies), rename (a title the user types)
+
 **Approval request**:
 A Run pausing until a human allows or denies a risky command; this client can answer it only over SSH.
 _Avoid_: permission prompt, confirmation

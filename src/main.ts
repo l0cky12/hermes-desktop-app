@@ -845,6 +845,21 @@ async function removeSession(id: string) {
   await refreshSessions();
 }
 
+/** Retitle: the model names the Session from its transcript, and the list shows the new title. */
+async function retitleSession(id: string, button: HTMLButtonElement) {
+  button.disabled = true;
+  button.textContent = "Retitling…";
+  try {
+    await invoke("retitle_session", { id });
+  } catch (e) {
+    ui!.sessionsError.textContent = `Couldn't retitle the session: ${asError(e).message}`;
+    button.disabled = false;
+    button.textContent = "Retitle";
+    return;
+  }
+  await refreshSessions();
+}
+
 async function refreshSessions() {
   let sessions: Session[];
   try {
@@ -869,7 +884,12 @@ async function refreshSessions() {
           del.textContent = "Delete";
         }, 3000);
       };
-      const li = h("li", { onclick: () => openSession(s.id) }, h("span", { textContent: s.title || s.preview || s.id }), ...(overSsh ? [] : [del]));
+      const retitle = h("button", { className: "link", textContent: "Retitle", title: "Ask the model for a new title based on the transcript" });
+      retitle.onclick = (e) => {
+        e.stopPropagation();
+        void retitleSession(s.id, retitle);
+      };
+      const li = h("li", { onclick: () => openSession(s.id) }, h("span", { textContent: s.title || s.preview || s.id }), retitle, ...(overSsh ? [] : [del]));
       li.dataset.id = s.id;
       return li;
     }),

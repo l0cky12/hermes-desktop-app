@@ -1,4 +1,4 @@
-//! One-shot `ssh <host> hermes …` commands for the Board and Skills (ADR 0002), separate from
+//! One-shot `ssh <host> hermes …` commands for the Board, Skills, and Retitle (ADR 0002), separate from
 //! the long-lived `hermes acp` connection. Every argument reaches the remote POSIX shell, so
 //! each one is single-quoted; Task bodies go on stdin, never on the command line.
 
@@ -140,6 +140,39 @@ pub fn kanban_dispatch(dry_run: bool) -> Cmd {
     hermes("hermes kanban dispatch", &args)
 }
 
+/// `-p <profile> `, or nothing for the Gateway's default Profile.
+fn profile_flag(profile: Option<&str>) -> String {
+    profile.map(|p| format!("-p {} ", quote(p))).unwrap_or_default()
+}
+
+/// `hermes [-p P] sessions rename -- <id> <title>`: the title stays one argument, so its spacing survives.
+pub fn sessions_rename(profile: Option<&str>, id: &str, title: &str) -> Cmd {
+    let script = format!("exec hermes {}sessions rename -- {} {}", profile_flag(profile), quote(id), quote(title));
+    Cmd { summary: "hermes sessions rename", script, stdin: None }
+}
+
+pub fn sessions_delete(profile: Option<&str>, id: &str) -> Cmd {
+    let script = format!("exec hermes {}sessions delete --yes -- {}", profile_flag(profile), quote(id));
+    Cmd { summary: "hermes sessions delete", script, stdin: None }
+}
+
+/// One question to the model, as `hermes chat` reads it from stdin; `chat_result` reads the answer.
+/// No one can answer an Approval request there, so its only toolset is `todo`, which can't touch
+/// the host. Hermes keeps its Session out of listings but still stores it.
+pub fn ask(profile: Option<&str>, prompt: &str) -> Cmd {
+    let script = format!("exec hermes {}chat --format=stream-json --toolsets=todo --query-file -", profile_flag(profile));
+    Cmd { summary: "hermes chat", script, stdin: Some(prompt.to_owned()) }
+}
+
+/// The closing `{"type":"result", "session_id", "text", …}` line of `hermes chat --format=stream-json`.
+pub fn chat_result(stdout: &str) -> Result<Value, Error> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok().filter(|v| v["type"] == "result"))
+        .ok_or_else(|| Error::Http("hermes chat printed no result".into()))
+}
+
 /// The active Profile's home: `hermes config path` names its config.yaml (last line, past any chatter).
 const PROFILE_HOME: &str = "home=$(hermes config path | tail -n 1) && home=${home%/*} || exit 1";
 
@@ -212,6 +245,29 @@ mod tests {
         let cmd = kanban_comment("-t_1", "$(rm -rf ~) it's");
         assert_eq!(argv_seen_by_hermes(&cmd), ["kanban", "comment", "--", "-t_1", "$(rm -rf ~) it's"]);
         assert_eq!(cmd.summary, "hermes kanban comment");
+    }
+
+    #[test]
+    fn retitling_asks_hermes_with_the_prompt_on_stdin_then_cleans_up_and_renames_as_the_profile() {
+        for text in NASTY {
+            let cmd = ask(Some("coder"), text);
+            assert_eq!(argv_seen_by_hermes(&cmd), ["-p", "coder", "chat", "--format=stream-json", "--toolsets=todo", "--query-file", "-"]);
+            assert_eq!(cmd.stdin.as_deref(), Some(text));
+            let cmd = sessions_rename(Some("coder"), "-s_1", text);
+            assert_eq!(argv_seen_by_hermes(&cmd), ["-p", "coder", "sessions", "rename", "--", "-s_1", text]);
+            assert_eq!(argv_seen_by_hermes(&sessions_delete(Some("coder"), text)), ["-p", "coder", "sessions", "delete", "--yes", "--", text]);
+        }
+        assert_eq!(argv_seen_by_hermes(&ask(None, "t"))[0], "chat");
+        assert_eq!(argv_seen_by_hermes(&sessions_rename(None, "s", "a  b")), ["sessions", "rename", "--", "s", "a  b"]);
+    }
+
+    #[test]
+    fn the_chat_result_is_the_last_result_line() {
+        let stdout = "hermes: updating...\n{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}\n\
+                      {\"type\":\"text\",\"text\":\"Printer\"}\n{\"type\":\"result\",\"session_id\":\"s1\",\"exit_code\":0,\"text\":\"Printer jams\"}\n";
+        let result = chat_result(stdout).unwrap();
+        assert_eq!((result["session_id"].as_str(), result["text"].as_str()), (Some("s1"), Some("Printer jams")));
+        assert!(chat_result("{\"type\":\"text\",\"text\":\"x\"}\n").is_err());
     }
 
     #[test]

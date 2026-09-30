@@ -57,6 +57,10 @@ Host hermes-box
   ControlPersist 10m
 ```
 
+## Sessions
+
+**Retitle** on a Session asks the model for a new title based on the transcript (the opening message and as much of the latest as fits in about 6,000 characters) and saves it as the Session's title. Hermes has no endpoint for this, so the app asks on the Profile's default model the way any client would: over HTTP with a chat completion (`POST /v1/chat/completions`), which runs as one agent turn with the API server's usual tools, since a request can't turn them off; over SSH with `hermes chat --query-file -`, limited to the `todo` toolset because no one is there to answer an Approval request. Hermes stores that question as a Session of its own, so the app deletes it (`DELETE /api/sessions/{id}` or `hermes sessions delete`) before saving the title (`PATCH /api/sessions/{id}` or `hermes sessions rename`). Hermes titles are unique, so a title another Session already has is refused.
+
 ## Profiles, models, and reasoning
 
 The bar under the message box picks the **Profile** (person icon), model (CPU icon), and Reasoning level (brain icon).
