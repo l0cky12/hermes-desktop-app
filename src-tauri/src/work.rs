@@ -180,8 +180,14 @@ pub struct McpServer {
     pub plugin: Option<String>,
 }
 
+/// A list's entries as text, the way Hermes `str()`s them; nulls and nested values are dropped.
 fn strings(v: &Value) -> Vec<String> {
-    v.as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|s| s.as_str().map(Into::into)).collect()
+    let text = |s: &Value| match s {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(_) | Value::Bool(_) => Some(s.to_string()),
+        _ => None,
+    };
+    v.as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(text).collect()
 }
 
 fn env_names(v: &Value) -> Vec<String> {
@@ -288,9 +294,13 @@ pub struct McpTool {
     pub description: Option<String>,
 }
 
-/// A successful `hermes mcp test`: the tool table under "Tools discovered: N", one
-/// `    name   description` line each (hermes_cli/mcp_config.py `_print_tools`).
+/// `hermes mcp test`'s stdout. A failure is its one `✗ Connection failed …` line (the lines
+/// before it can show part of an auth header). A success is the tool table under
+/// "Tools discovered: N", one `    name   description` line each (hermes_cli/mcp_config.py `_print_tools`).
 pub fn mcp_test_from_cli(out: &str) -> McpTest {
+    if let Some(why) = out.lines().find_map(|l| l.trim().strip_prefix("✗ ")) {
+        return McpTest { ok: false, error: Some(why.into()), tools: Vec::new(), prompts: None, resources: None };
+    }
     let tools = out
         .lines()
         .skip_while(|l| !l.contains("Tools discovered:"))
@@ -507,5 +517,22 @@ mod tests {
             McpTool { name: "bare".into(), description: None },
         ]);
         assert!(mcp_test_from_cli("  ✓ Connected (3ms)\n  ✓ Tools discovered: 0\n\n").tools.is_empty());
+    }
+
+    #[test]
+    fn a_failed_cli_test_reports_only_the_failure_line() {
+        // The auth line carries part of a header value; it must not reach the reason.
+        let out = "\n  Testing 'learn'...\n  Transport: HTTP → https://l/mcp\n    Authorization: Bear...1234\n  ✗ Connection failed (0.4s): Connection refused\n  Check the server is running and the URL/command in its config, then run: hermes mcp test learn\n\n";
+        let test = mcp_test_from_cli(out);
+        assert_eq!((test.ok, test.error.as_deref()), (false, Some("Connection failed (0.4s): Connection refused")));
+        assert!(test.tools.is_empty());
+    }
+
+    #[test]
+    fn non_string_args_and_filter_entries_are_kept() {
+        // Hermes str()s both, so a YAML `- 8080` is an argument and `include: [123]` names a tool.
+        let servers = mcp_from_config(json!({ "a": { "command": "srv", "args": ["--port", 8080], "tools": { "include": [123] } } }));
+        assert_eq!(servers[0].args, ["--port", "8080"]);
+        assert_eq!(servers[0].tools, "Only 123");
     }
 }

@@ -886,14 +886,7 @@ async fn mcp_servers(state: State<'_, AppState>) -> Result<Vec<work::McpServer>,
 async fn mcp_test(state: State<'_, AppState>, name: String) -> Result<work::McpTest, Error> {
     let profile = state.lock().profile.clone();
     if let Some(host) = state.ssh_host() {
-        // A server that can't be reached makes `hermes mcp test` exit 1, and its reason becomes the error.
-        return match remote::run(&host, remote::mcp_test(profile.as_deref(), &name)).await {
-            Err(Error::Http(why)) => {
-                let why = why.strip_prefix("hermes mcp test failed: ").unwrap_or(&why).replace("✗ ", "");
-                Ok(work::McpTest { ok: false, error: Some(why), tools: Vec::new(), prompts: None, resources: None })
-            }
-            out => Ok(work::mcp_test_from_cli(&out?)),
-        };
+        return Ok(work::mcp_test_from_cli(&remote::run(&host, remote::mcp_test(profile.as_deref(), &name)).await?));
     }
     let query: Vec<(&str, &str)> = profile.as_deref().map(|p| vec![("profile", p)]).unwrap_or_default();
     let request = state.dashboard(Method::POST, &["api", "mcp", "servers", &name, "test"], &query)?;

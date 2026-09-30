@@ -1437,6 +1437,8 @@ function mcpView(): View {
       return row;
     }));
     if (!servers.length && !error.textContent) list.append(h("p", { className: "muted", textContent: "This profile has no MCP servers." }));
+    // `hermes mcp list` and `hermes config get` only see the Profile's config.
+    if (overSsh) list.append(h("p", { className: "muted", textContent: "Over SSH, MCP servers that plugins provide aren't listed." }));
   }
 
   function choose(s: McpServer) {
@@ -1480,7 +1482,6 @@ function mcpView(): View {
       servers = await call<McpServer[]>("mcp_servers");
       error.textContent = "";
     } catch (e) {
-      servers = [];
       error.textContent = `Couldn't load MCP servers: ${asError(e).message}`;
     }
     const again = servers.find((s) => s.name === chosen);

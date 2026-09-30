@@ -185,10 +185,11 @@ pub fn mcp_servers(profile: Option<&str>) -> Cmd {
     Cmd { summary: "hermes config get mcp_servers", script, stdin: None }
 }
 
-/// Connects to one MCP server and prints its tools; exits 1 if it can't connect, 3 if there's no
-/// such server. stderr joins stdout so a failure's reason is what `run` reports.
+/// Connects to one MCP server and prints its tools. Hermes exits 1 when it can't connect; that
+/// is a test result, so the script exits 0 and `work` reads the reason from stdout. Any other
+/// failure (3 is "no such server") stays an error.
 pub fn mcp_test(profile: Option<&str>, name: &str) -> Cmd {
-    let script = format!("exec hermes {}mcp test -- {} 2>&1", profile_flag(profile), quote(name));
+    let script = format!("hermes {}mcp test -- {}; code=$?; [ $code -eq 1 ] && exit 0; exit $code", profile_flag(profile), quote(name));
     Cmd { summary: "hermes mcp test", script, stdin: None }
 }
 
@@ -199,16 +200,20 @@ mod tests {
     const NASTY: [&str; 7] = ["it's", "$(touch /tmp/pwned)", "`id`", "a\nb", "-rf", "\"q\" \\ ;|&", ""];
 
     /// Runs a command's remote line in a local `sh` whose `hermes` prints its argv NUL-separated.
-    fn argv_seen_by_hermes(cmd: &Cmd) -> Vec<String> {
+    /// Runs `cmd` locally with `hermes` replaced by a shell script whose body is `fake`.
+    fn run_with_fake_hermes(cmd: &Cmd, fake: &str) -> std::process::Output {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let home = std::env::temp_dir().join(format!("hd-remote-{}-{n}", std::process::id()));
         let bin = home.join(".local/bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("hermes"), "#!/bin/sh\nprintf '%s\\0' \"$@\"\n").unwrap();
+        std::fs::write(bin.join("hermes"), format!("#!/bin/sh\n{fake}\n")).unwrap();
         std::process::Command::new("chmod").arg("+x").arg(bin.join("hermes")).status().unwrap();
-        let out = std::process::Command::new("sh").arg("-c").arg(cmd.remote_line()).env("HOME", &home).output().unwrap();
-        let text = String::from_utf8(out.stdout).unwrap();
+        std::process::Command::new("sh").arg("-c").arg(cmd.remote_line()).env("HOME", &home).output().unwrap()
+    }
+
+    fn argv_seen_by_hermes(cmd: &Cmd) -> Vec<String> {
+        let text = String::from_utf8(run_with_fake_hermes(cmd, "printf '%s\\0' \"$@\"").stdout).unwrap();
         text.split_terminator('\0').map(str::to_owned).collect()
     }
 
@@ -310,6 +315,16 @@ mod tests {
             assert_eq!(argv_seen_by_hermes(&mcp_test(Some("coder"), name)), ["-p", "coder", "mcp", "test", "--", name]);
         }
         assert_eq!(argv_seen_by_hermes(&mcp_test(None, "gh")), ["mcp", "test", "--", "gh"]);
+    }
+
+    #[test]
+    fn only_a_failed_connection_counts_as_a_test_result() {
+        // 1 is "connection failed" (output to parse); 3 (no such server) and 127 (no hermes) stay errors.
+        for (exit, status) in [(0, 0), (1, 0), (3, 3), (127, 127)] {
+            let out = run_with_fake_hermes(&mcp_test(None, "gh"), &format!("echo out; echo err >&2; exit {exit}"));
+            assert_eq!(out.status.code(), Some(status), "hermes exit {exit}");
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), "out\n", "stderr stays out of the parsed output");
+        }
     }
 
     /// Read-only, like `reads_board_and_skills_from_real_hermes`.
