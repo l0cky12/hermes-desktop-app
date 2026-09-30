@@ -861,7 +861,7 @@ async function refreshSessions() {
       const more = h("button", { className: "icon-btn", title: "Session actions" }, icon("ellipsis"));
       more.setAttribute("aria-label", "Session actions");
       more.onclick = (e) => (e.stopPropagation(), toggleSessionMenu(s, more, title));
-      const li = h("li", { onclick: () => void openSession(s.id) }, title, more);
+      const li = h("li", { onclick: () => (closeSessionMenu(), void openSession(s.id)) }, title, more);
       li.dataset.id = s.id;
       return li;
     }),
@@ -932,9 +932,11 @@ function renameSession(s: Session, title: HTMLElement) {
     if (done) return;
     done = true;
     const name = box.value.trim();
-    void sessionAction("rename the session", async () => {
-      if (save && name && name !== s.title) await invoke("rename_session", { id: s.id, title: name });
-    });
+    if (!save || !name || name === s.title) {
+      box.replaceWith(title); // nothing to save: no round trip
+      return;
+    }
+    void sessionAction("rename the session", () => invoke("rename_session", { id: s.id, title: name }));
   };
   box.onkeydown = (e) => {
     if (e.key === "Enter") finish(true);
@@ -945,7 +947,7 @@ function renameSession(s: Session, title: HTMLElement) {
   box.select();
 }
 
-/** Export as Markdown or HTML: a file saved wherever the user picks, which is also how a Session is shared. */
+/** Export as Markdown or HTML: a file saved wherever the user picks, the way to hand a Session to someone else. */
 async function exportSession(s: Session, ext: "md" | "html") {
   try {
     const turns = transcriptTurns(await invoke<Message[]>("session_messages", { id: s.id }));

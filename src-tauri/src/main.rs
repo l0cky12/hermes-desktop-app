@@ -621,7 +621,7 @@ fn export_contents<'a>(path: &Path, html: &'a str, markdown: Option<&'a str>) ->
     markdown.filter(|_| !is_html).unwrap_or(html)
 }
 
-/// Share and Export: the native save dialog, then the file is written here, so the webview
+/// Export: the native save dialog, then the file is written here, so the webview
 /// never names a path. `false` = the dialog was cancelled.
 #[tauri::command]
 async fn save_file(app: tauri::AppHandle, name: String, html: String, markdown: Option<String>) -> Result<bool, Error> {
