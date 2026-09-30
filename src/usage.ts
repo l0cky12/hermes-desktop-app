@@ -39,12 +39,14 @@ export const compact = (n: number) => COMPACT.format(n).replace("K", "k");
 /** "1.2k in · 350 out · 42% cached": the share of input tokens read from the prompt cache. */
 export function describeUsage(u: Usage): string {
   const parts = [`${compact(u.input)} in`, `${compact(u.output)} out`];
-  if (u.input) parts.push(`${Math.round((u.cached / u.input) * 100)}% cached`);
+  if (u.input) parts.push(`${Math.min(100, Math.round((u.cached / u.input) * 100))}% cached`);
   return parts.join(" · ");
 }
 
 /** Dollars as Hermes estimates them from its price list. Hermes records a model it has no price for
  * as $0 (and never fills `actual_cost_usd`), so $0 shows as no cost at all. */
 export function describeCost(usd: number | null | undefined): string | null {
-  return typeof usd === "number" && usd > 0 ? `≈ $${usd.toFixed(usd >= 1 ? 2 : 4)}` : null;
+  if (typeof usd !== "number" || usd <= 0) return null;
+  if (usd < 0.0001) return "≈ <$0.0001"; // never "$0.0000"
+  return `≈ $${usd.toFixed(usd >= 0.99995 ? 2 : 4)}`;
 }

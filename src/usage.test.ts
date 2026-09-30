@@ -27,6 +27,8 @@ test("totals add up", () => {
 test("cost is Hermes's estimate, and $0 means Hermes has no price for the model", () => {
   assert.equal(describeCost(0.01234), "≈ $0.0123");
   assert.equal(describeCost(2.5), "≈ $2.50");
+  assert.equal(describeCost(0.00003), "≈ <$0.0001");
+  assert.equal(describeCost(0.99996), "≈ $1.00");
   assert.equal(describeCost(0), null);
   assert.equal(describeCost(null), null); // a Session with no Turns yet
 });
