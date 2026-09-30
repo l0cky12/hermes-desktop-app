@@ -1406,10 +1406,14 @@ function skillsView(): View {
       detail.replaceChildren(pick);
       render();
     }
+    const asked = profile;
     try {
-      skills = await call<Skill[]>("skills_list");
+      const got = await call<Skill[]>("skills_list");
+      if (asked !== profile) return; // Profile changed while listing: that answer is stale.
+      skills = got;
       error.textContent = "";
     } catch (e) {
+      if (asked !== profile) return;
       error.textContent = `Couldn't load skills: ${asError(e).message}`;
     }
     render();
