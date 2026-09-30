@@ -1073,9 +1073,9 @@ function kanbanView(): View {
   let assignees: string[] = [];
   let status = ""; // the status chip filter, "" for all
   let timer: number | undefined;
-  let board: string | null = null; // the chosen Board's slug; `null` is the host's current Board
+  let board: string | null = null; // the Chosen Board's slug; `null` is the host's current Board
 
-  /** A Board command on the chosen Board, never by changing the host's own current Board. */
+  /** A Board command on the Chosen Board, never by changing the host's own current Board. */
   const kanban = <T>(cmd: string, args: Record<string, unknown> = {}) => call<T>(cmd, { board, ...args });
 
   const boardPicker = h("select", { onchange: () => useBoard(boardPicker.value) });
@@ -1083,30 +1083,38 @@ function kanbanView(): View {
 
   /** Lists the host's Boards and picks the one last chosen on this connection, else the host's current Board. */
   async function loadBoards() {
-    assignees = []; // the Board may differ from the last load, and each Board knows its own
+    assignees = []; // re-listed on Refresh
+    let next: string | null = null;
     try {
       const list = await call<Boards>("kanban_boards");
+      if (!list.boards.length) throw new Error("the host listed none");
       boardPicker.replaceChildren(...list.boards.map((b) => h("option", { value: b.slug, textContent: b.name || b.slug })));
-      board = startBoard(localStorage, connection, list.boards.map((b) => b.slug), list.current);
-      boardPicker.value = board;
+      next = startBoard(localStorage, connection, list.boards.map((b) => b.slug), list.current);
+      boardPicker.value = next;
       boardPicker.title = "Board";
     } catch (e) {
-      board = null;
       boardPicker.replaceChildren(h("option", { textContent: "Current board" }));
       boardPicker.title = `Couldn't list boards: ${asError(e).message}`;
     }
-    boardPicker.disabled = board === null;
+    boardPicker.disabled = next === null;
+    if (next !== board) clearBoard(); // e.g. the saved Board was deleted: don't act on its Tasks
+    board = next;
   }
 
   function useBoard(slug: string) {
     board = slug;
     saveBoard(localStorage, connection, slug);
+    clearBoard();
+    void load();
+  }
+
+  /** Forgets what the last Board showed, before another Board loads. */
+  function clearBoard() {
     assignees = []; // each Board knows its own
     tasks = [];
     lastDispatch.textContent = "";
     drawer.hidden = true;
     render();
-    void load();
   }
 
   const search = input({ type: "search", placeholder: "Search tasks", required: false });
