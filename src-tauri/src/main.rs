@@ -884,7 +884,7 @@ async fn stop_run(state: State<'_, AppState>, run_id: String) -> Result<(), Erro
     Ok(())
 }
 
-// ---- Board and Skills: Dashboard routes, or `ssh host hermes …` (ADR 0002) ----
+// ---- Board, Skills, and MCP servers: Dashboard routes, or `ssh host hermes …` (ADR 0002) ----
 
 #[tauri::command]
 async fn kanban_boards(state: State<'_, AppState>) -> Result<work::Boards, Error> {
@@ -1014,6 +1014,37 @@ async fn skill_toggle(state: State<'_, AppState>, name: String, enabled: bool) -
     remote::run(&host, remote::skills_set_disabled(profile.as_deref(), &disabled)).await.map(drop)
 }
 
+/// The active Profile's MCP servers. Over SSH, only those in its config (not plugin-provided ones).
+#[tauri::command]
+async fn mcp_servers(state: State<'_, AppState>) -> Result<Vec<work::McpServer>, Error> {
+    let profile = state.lock().profile.clone();
+    if let Some(host) = state.ssh_host() {
+        // ponytail: config only, like `hermes mcp list`; no CLI command prints plugin-provided servers.
+        return match remote::run(&host, remote::mcp_servers(profile.as_deref())).await {
+            // An unset key is Hermes's answer for "no MCP servers".
+            Err(Error::Http(why)) if why.contains("Config key not set") => Ok(Vec::new()),
+            out => Ok(work::mcp_from_config(remote::json(&out?)?)),
+        };
+    }
+    let query: Vec<(&str, &str)> = profile.as_deref().map(|p| vec![("profile", p)]).unwrap_or_default();
+    Ok(work::mcp_from_dashboard(state.dashboard_json(state.dashboard(Method::GET, &["api", "mcp", "servers"], &query)?).await?))
+}
+
+/// Connects to one MCP server, lists its tools, and disconnects.
+#[tauri::command]
+async fn mcp_test(state: State<'_, AppState>, name: String) -> Result<work::McpTest, Error> {
+    let profile = state.lock().profile.clone();
+    if let Some(host) = state.ssh_host() {
+        return Ok(work::mcp_test_from_cli(&remote::run(&host, remote::mcp_test(profile.as_deref(), &name)).await?));
+    }
+    let query: Vec<(&str, &str)> = profile.as_deref().map(|p| vec![("profile", p)]).unwrap_or_default();
+    let request = state.dashboard(Method::POST, &["api", "mcp", "servers", &name, "test"], &query)?;
+    // The probe waits up to the MCP server's connect timeout (30 s by default) before answering.
+    let response = send(&state.slow_client, request).await?;
+    state.absorb(&response).await;
+    serde_json::from_value(json_body(response).await?).map_err(|e| Error::Http(format!("Unreadable test result: {e}")))
+}
+
 /// The Client log so far; new lines arrive on `on_line`.
 #[tauri::command]
 fn client_log(on_line: Channel<log::Line>) -> Vec<log::Line> {
@@ -1135,6 +1166,8 @@ fn main() {
             skills_list,
             skill_content,
             skill_toggle,
+            mcp_servers,
+            mcp_test,
             client_log,
             clear_client_log,
             clipboard_image,

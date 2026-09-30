@@ -142,6 +142,10 @@ _Avoid_: run (reserved for Run), nudge
 An instruction file (SKILL.md) installed for a Profile, grouped by category, which can be enabled or disabled for that Profile.
 _Avoid_: plugin, tool, prompt
 
+**MCP server**:
+An external tool provider a Profile connects to over the Model Context Protocol, set up in that Profile's config or supplied by a plugin, and enabled or disabled for that Profile.
+_Avoid_: plugin, integration, connector
+
 ### Diagnostics
 
 **Client log**:

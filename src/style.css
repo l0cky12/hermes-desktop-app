@@ -220,6 +220,16 @@ pre code { background: none; padding: 0; }
 .skill-head { margin-bottom: 0.857rem; }
 .skill-head h2 { margin: 0; }
 
+/* MCP servers (layout shared with Skills) */
+.skills .panel > h2 { margin: 0; }
+.skill-head button { margin-left: auto; }
+.mcp-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0.429rem 1.143rem; margin: 0 0 1.143rem; }
+.mcp-facts dt { color: var(--muted); }
+.mcp-facts dd { margin: 0; overflow-wrap: anywhere; }
+.mcp-tools { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.429rem; }
+.mcp-tools li { display: flex; flex-direction: column; }
+.mcp-tools .name { font-weight: 500; }
+
 /* Logs */
 .logs { display: flex; flex-direction: column; height: 100%; padding: 1rem 1.429rem; gap: 0.429rem; min-width: 0; }
 .logs .toolbar h2 { margin: 0; flex: 1; white-space: nowrap; }

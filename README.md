@@ -1,6 +1,6 @@
 # Hermes Desktop
 
-A small Tauri client for a self-hosted Hermes Agent gateway: pairing and sign-in, streaming chat with tool progress and Stop, a Sessions panel, copying a whole Session as Markdown, Profile, model, and Reasoning level pickers, Dictation, drag-and-drop, picked, and pasted attachments, Appearance settings, and, from the icon rail, the Hermes Kanban Board, Skills with on/off toggles, and the Client log. Vocabulary is in [CONTEXT.md](CONTEXT.md).
+A small Tauri client for a self-hosted Hermes Agent gateway: pairing and sign-in, streaming chat with tool progress and Stop, a Sessions panel, copying a whole Session as Markdown, Profile, model, and Reasoning level pickers, Dictation, drag-and-drop, picked, and pasted attachments, Appearance settings, and, from the icon rail, the Hermes Kanban Board, Skills with on/off toggles, MCP servers, and the Client log. Vocabulary is in [CONTEXT.md](CONTEXT.md).
 
 ## Install on Arch Linux
 
@@ -34,7 +34,7 @@ Then, with Node 20+ and a stable Rust toolchain:
 npm install
 npm run tauri dev                    # development window
 npm run tauri build -- --no-bundle   # release binary: src-tauri/target/release/hermes-desktop
-(cd src-tauri && cargo test)         # SSE parser, URL validation, cookie jar, attachments, pickers, SSH quoting, Board/Skills parsing, Client log
+(cd src-tauri && cargo test)         # SSE parser, URL validation, cookie jar, attachments, pickers, SSH quoting, Board/Skills/MCP server parsing, Client log
 npm test                             # webview preferences, Session transcript Markdown (Node 22.18+)
 ```
 
@@ -87,13 +87,14 @@ The copy icon in the same bar copies the open Session to the clipboard as Markdo
 
 The microphone records until you click it again, or for up to 2 minutes. The Dashboard's speech-to-text (`POST /api/audio/transcribe`) then turns the recording into text, which is inserted at the cursor for you to edit. This uses the Profile's own voice settings. It isn't available over SSH.
 
-## Kanban, Skills, and Logs
+## Kanban, Skills, MCP servers, and Logs
 
 - **Kanban** shows one Board at a time: pick it next to the Board heading. The app remembers the last Board per connection and otherwise starts on the host's current Board; picking one here never changes the host's current Board for Hermes or its CLI. Filter by text, Assignee, tenant, or status (click a stats chip). Create a Task from the "New task" box (Enter), or use **More…** for body, Assignee, priority, and tenant. Click a Task for its body and Comments. **Preview dispatcher** shows what one Dispatch would do; **Run dispatcher** runs one now (at most 8 spawns). Tasks are read-only apart from Comments.
 - **Skills** lists the Skills of the Profile picked in Chat (named at the top of the list) by category, and reloads when you pick another Profile. Re-opening it shows the last list at once (until the app quits) and refreshes it in the background. Click one to read its SKILL.md; the switch enables or disables it on every platform. Essential Skills (`hermes-agent`) can't be switched off. Over SSH, only the Profile's own `skills/` directory is listed, not `skills.external_dirs`.
+- **MCP servers** lists the active Profile's MCP servers (transport, enabled or disabled, and whether they come from its config or a plugin). Click one for its URL or command, auth, which of its tools Hermes uses, and the names of its environment variables (never their values; the URL and command arguments are shown as Hermes returns them). **Test** connects to it and lists every tool it offers, or says why it couldn't. This view is read-only. Over SSH, the list comes from `hermes config get mcp_servers --json`, so plugin-provided servers aren't shown, and Test runs `hermes mcp test`, which cuts tool descriptions at 55 characters.
 - **Logs** is the Client log (see below).
 
-The dev mock (`node mock/server.mjs`) serves two small Boards (Default and Ops) and a Skills list too, with different Skills disabled in each Profile; `MOCK_KANBAN=off` answers like a Hermes with the Kanban plugin disabled, and `MOCK_SKILLS_MS=2000` makes the Skills list as slow as over SSH.
+The dev mock (`node mock/server.mjs`) serves two small Boards (Default and Ops) a Skills list, and an MCP server list (with Test results) too, with different Skills disabled in each Profile; `MOCK_KANBAN=off` answers like a Hermes with the Kanban plugin disabled, and `MOCK_SKILLS_MS=2000` makes the Skills list as slow as over SSH.
 
 ## Where things are stored
 

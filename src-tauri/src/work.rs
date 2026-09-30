@@ -1,4 +1,4 @@
-//! The Board and Skills in one shape, whichever way Hermes is reached (Dashboard or SSH).
+//! The Board, Skills, and MCP servers in one shape, whichever way Hermes is reached (Dashboard or SSH).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -193,6 +193,164 @@ fn frontmatter_fields(frontmatter: &str) -> HashMap<String, String> {
     fields
 }
 
+/// An MCP server as the MCP servers view shows it. Env values never leave Rust: only their names.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct McpServer {
+    pub name: String,
+    pub transport: String,
+    pub url: Option<String>,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: Vec<String>,
+    pub auth: Option<String>,
+    pub enabled: bool,
+    /// Which of its tools Hermes registers, in words.
+    pub tools: String,
+    /// `config` (the Profile's config.yaml) or `plugin`.
+    pub source: String,
+    pub plugin: Option<String>,
+}
+
+/// A list's entries as text, the way Hermes `str()`s them; nulls and nested values are dropped.
+fn strings(v: &Value) -> Vec<String> {
+    let text = |s: &Value| match s {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(_) | Value::Bool(_) => Some(s.to_string()),
+        _ => None,
+    };
+    v.as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(text).collect()
+}
+
+fn env_names(v: &Value) -> Vec<String> {
+    let mut names: Vec<String> = v.as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// `tools.include` wins over `tools.exclude`; either may be one name or a list, anything else is
+/// ignored (tools/mcp_tool_registration.py `_make_tool_filter`).
+fn tool_selection(tools: &Value) -> String {
+    let names = |v: &Value| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(_) => Some(strings(v).join(", ")),
+        _ => None,
+    };
+    match (names(&tools["include"]), names(&tools["exclude"])) {
+        (Some(include), _) if include.is_empty() => "No tools".into(),
+        (Some(include), _) => format!("Only {include}"),
+        (None, Some(exclude)) if !exclude.is_empty() => format!("All tools except {exclude}"),
+        (None, _) => "All tools".into(),
+    }
+}
+
+/// `GET /api/mcp/servers` (hermes_cli/web_server_mcp.py `_mcp_server_summary`).
+pub fn mcp_from_dashboard(body: Value) -> Vec<McpServer> {
+    let list = body["servers"].as_array().cloned().unwrap_or_default();
+    list.iter()
+        .map(|s| McpServer {
+            name: text(&s["name"]),
+            transport: s["transport"].as_str().unwrap_or("unknown").into(),
+            url: s["url"].as_str().map(Into::into),
+            command: s["command"].as_str().map(Into::into),
+            args: strings(&s["args"]),
+            env: env_names(&s["env"]),
+            auth: s["auth"].as_str().map(Into::into),
+            enabled: s["enabled"].as_bool().unwrap_or(true),
+            tools: tool_selection(&s["tools"]),
+            source: s["source"].as_str().unwrap_or("config").into(),
+            plugin: s["plugin"].as_str().map(Into::into),
+        })
+        .collect()
+}
+
+/// `hermes config get mcp_servers --json`: the raw config map, summarized the way the Dashboard
+/// does it. Servers that plugins provide aren't in it.
+pub fn mcp_from_config(body: Value) -> Vec<McpServer> {
+    let map = body.as_object().cloned().unwrap_or_default();
+    let mut servers: Vec<McpServer> = map
+        .into_iter()
+        .filter(|(_, cfg)| cfg.is_object())
+        .map(|(name, cfg)| {
+            let url = cfg["url"].as_str().filter(|u| !u.is_empty()).map(String::from);
+            let command = cfg["command"].as_str().filter(|c| !c.is_empty()).map(String::from);
+            let authorization = cfg["headers"].as_object().is_some_and(|h| h.keys().any(|k| k.eq_ignore_ascii_case("authorization")));
+            McpServer {
+                transport: if url.is_some() { "http" } else if command.is_some() { "stdio" } else { "unknown" }.into(),
+                args: strings(&cfg["args"]),
+                env: env_names(&cfg["env"]),
+                auth: cfg["auth"].as_str().map(Into::into).or(authorization.then(|| "header".into())),
+                enabled: enabled(&cfg["enabled"]),
+                tools: tool_selection(&cfg["tools"]),
+                source: "config".into(),
+                plugin: None,
+                url,
+                command,
+                name,
+            }
+        })
+        .collect();
+    servers.sort_by(|a, b| a.name.cmp(&b.name));
+    servers
+}
+
+/// Hermes's `mcp_server_enabled`: absent, null, or unreadable means on.
+fn enabled(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !["false", "0", "no", "off"].contains(&s.trim().to_lowercase().as_str()),
+        _ => true,
+    }
+}
+
+/// `POST /api/mcp/servers/{name}/test`: a live probe's tools, or why it failed. Over SSH there
+/// are no prompt or resource counts.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct McpTest {
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<McpTool>,
+    #[serde(default)]
+    pub prompts: Option<i64>,
+    #[serde(default)]
+    pub resources: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct McpTool {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// `hermes mcp test`'s stdout. A failure is its one `✗ Connection failed …` line (the lines
+/// before it can show part of an auth header). A success is the tool table under
+/// "Tools discovered: N", one `    name   description` line each (hermes_cli/mcp_config.py `_print_tools`).
+pub fn mcp_test_from_cli(out: &str) -> McpTest {
+    if let Some(why) = out.lines().find_map(|l| l.trim().strip_prefix("✗ ")) {
+        return McpTest { ok: false, error: Some(why.into()), tools: Vec::new(), prompts: None, resources: None };
+    }
+    if !out.contains("Tools discovered:") {
+        // Not a connection failure but not a result either: hermes exited early (config error,
+        // broken launcher). Its reason went to stderr; the last stdout line is the best hint.
+        let last = out.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("hermes mcp test printed no result");
+        return McpTest { ok: false, error: Some(last.into()), tools: Vec::new(), prompts: None, resources: None };
+    }
+    let tools = out
+        .lines()
+        .skip_while(|l| !l.contains("Tools discovered:"))
+        .skip(1)
+        .filter_map(|l| {
+            let (name, description) = l.trim().split_once(char::is_whitespace).unwrap_or((l.trim(), ""));
+            let description = description.trim();
+            (!name.is_empty()).then(|| McpTool { name: name.into(), description: (!description.is_empty()).then(|| description.into()) })
+        })
+        .collect();
+    McpTest { ok: true, error: None, tools, prompts: None, resources: None }
+}
+
 /// What the New task form sends. Serializes straight into the Dashboard's `POST /tasks` body.
 #[derive(Deserialize, Serialize)]
 pub struct NewTask {
@@ -320,5 +478,111 @@ mod tests {
         assert!(skills_from_ssh("null\n@@@skills\n@@@home /h\n").unwrap().0.is_empty());
         let (skills, _) = skills_from_ssh("@@@skills\n@@@home /h\n@@@ ./a/SKILL.md\nname: a\n").unwrap();
         assert_eq!(skills, [skill("a", "", None, true, false)]);
+    }
+
+    fn mcp(name: &str, transport: &str, enabled: bool, tools: &str, source: &str) -> (String, String, bool, String, String) {
+        (name.into(), transport.into(), enabled, tools.into(), source.into())
+    }
+
+    fn mcp_rows(servers: &[McpServer]) -> Vec<(String, String, bool, String, String)> {
+        servers.iter().map(|s| (s.name.clone(), s.transport.clone(), s.enabled, s.tools.clone(), s.source.clone())).collect()
+    }
+
+    #[test]
+    fn dashboard_mcp_servers_keep_env_names_only() {
+        let body = json!({ "servers": [
+            { "name": "github", "transport": "stdio", "url": null, "command": "npx", "args": ["-y", "@mcp/github"],
+              "env": { "GITHUB_TOKEN": "ghp_...abcd", "A": "" }, "auth": null, "enabled": true,
+              "tools": { "exclude": ["delete_repo"] }, "source": "config", "plugin": null },
+            { "name": "linear", "transport": "http", "url": "https://mcp.linear.app/sse", "command": null, "args": [],
+              "env": {}, "auth": "oauth", "enabled": false, "tools": null, "source": "plugin", "plugin": "linear-kit" },
+        ] });
+        let servers = mcp_from_dashboard(body);
+        assert_eq!(mcp_rows(&servers), [
+            mcp("github", "stdio", true, "All tools except delete_repo", "config"),
+            mcp("linear", "http", false, "All tools", "plugin"),
+        ]);
+        assert_eq!(servers[0].env, ["A", "GITHUB_TOKEN"]);
+        assert_eq!(servers[0].args, ["-y", "@mcp/github"]);
+        assert_eq!(servers[1].url.as_deref(), Some("https://mcp.linear.app/sse"));
+        assert_eq!(servers[1].plugin.as_deref(), Some("linear-kit"));
+        assert!(!format!("{servers:?}").contains("ghp_"));
+    }
+
+    #[test]
+    fn config_mcp_servers_are_summarized_like_the_dashboard() {
+        let body = json!({
+            "zed": { "url": "https://z/mcp", "headers": { "Authorization": "Bear...1234" }, "tools": { "include": ["a", "b"], "exclude": ["c"] } },
+            "fs": { "command": "mcp-fs", "args": ["/srv"], "env": { "SECRET": "plain-value" }, "enabled": "off", "tools": { "include": [] } },
+            "odd": { "enabled": 0, "tools": { "include": "one" } },
+            "junk": "not a server",
+        });
+        let servers = mcp_from_config(body);
+        assert_eq!(mcp_rows(&servers), [
+            mcp("fs", "stdio", false, "No tools", "config"),
+            mcp("odd", "unknown", false, "Only one", "config"),
+            mcp("zed", "http", true, "Only a, b", "config"),
+        ]);
+        assert_eq!(servers[2].auth.as_deref(), Some("header"));
+        assert_eq!(servers[0].env, ["SECRET"]);
+        assert!(!format!("{servers:?}").contains("plain-value"));
+        assert!(mcp_from_config(Value::Null).is_empty());
+    }
+
+    #[test]
+    fn empty_or_unusable_tool_filters_select_every_tool() {
+        // Hermes's _make_tool_filter: an empty exclude removes nothing; an include that isn't a name or list is ignored.
+        let body = json!({
+            "a": { "command": "x", "tools": { "exclude": [] } },
+            "b": { "command": "x", "tools": { "include": 3, "exclude": "c" } },
+        });
+        let tools: Vec<String> = mcp_from_config(body).into_iter().map(|s| s.tools).collect();
+        assert_eq!(tools, ["All tools", "All tools except c"]);
+    }
+
+    #[test]
+    fn mcp_probe_results_parse() {
+        let ok: McpTest = serde_json::from_value(json!({ "ok": true, "prompts": 2, "resources": 0,
+            "tools": [{ "name": "search", "description": "Search issues", "schema_chars": 412 }, { "name": "bare", "description": null }] })).unwrap();
+        assert!(ok.ok && ok.error.is_none() && ok.prompts == Some(2));
+        assert_eq!(ok.tools, [
+            McpTool { name: "search".into(), description: Some("Search issues".into()) },
+            McpTool { name: "bare".into(), description: None },
+        ]);
+        let failed: McpTest = serde_json::from_value(json!({ "ok": false, "error": "Connection refused", "tools": [] })).unwrap();
+        assert_eq!((failed.ok, failed.error.as_deref(), failed.tools.len()), (false, Some("Connection refused"), 0));
+    }
+
+    #[test]
+    fn cli_test_output_lists_the_tools_after_the_count() {
+        // `hermes mcp test` on a pipe: no colors, descriptions cut at 55 characters.
+        let out = "\n  Testing 'learn'...\n  Transport: HTTP → https://l/mcp\n    Authorization: Bear...1234\n  ✓ Connected (1725ms)\n  ✓ Tools discovered: 2\n\n    microsoft_docs_search                Search official Microsoft/Azure documentation to find t...\n    bare\n\n";
+        let test = mcp_test_from_cli(out);
+        assert!(test.ok && test.error.is_none() && test.prompts.is_none());
+        assert_eq!(test.tools, [
+            McpTool { name: "microsoft_docs_search".into(), description: Some("Search official Microsoft/Azure documentation to find t...".into()) },
+            McpTool { name: "bare".into(), description: None },
+        ]);
+        assert!(mcp_test_from_cli("  ✓ Connected (3ms)\n  ✓ Tools discovered: 0\n\n").tools.is_empty());
+        // No result at all (hermes died before testing) is a failure, never "Connected, 0 tools".
+        assert!(!mcp_test_from_cli("").ok);
+        assert_eq!(mcp_test_from_cli("  Testing 'x'...\n").error.as_deref(), Some("Testing 'x'..."));
+    }
+
+    #[test]
+    fn a_failed_cli_test_reports_only_the_failure_line() {
+        // The auth line carries part of a header value; it must not reach the reason.
+        let out = "\n  Testing 'learn'...\n  Transport: HTTP → https://l/mcp\n    Authorization: Bear...1234\n  ✗ Connection failed (0.4s): Connection refused\n  Check the server is running and the URL/command in its config, then run: hermes mcp test learn\n\n";
+        let test = mcp_test_from_cli(out);
+        assert_eq!((test.ok, test.error.as_deref()), (false, Some("Connection failed (0.4s): Connection refused")));
+        assert!(test.tools.is_empty());
+    }
+
+    #[test]
+    fn non_string_args_and_filter_entries_are_kept() {
+        // Hermes str()s both, so a YAML `- 8080` is an argument and `include: [123]` names a tool.
+        let servers = mcp_from_config(json!({ "a": { "command": "srv", "args": ["--port", 8080], "tools": { "include": [123] } } }));
+        assert_eq!(servers[0].args, ["--port", "8080"]);
+        assert_eq!(servers[0].tools, "Only 123");
     }
 }
