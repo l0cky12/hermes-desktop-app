@@ -5,6 +5,7 @@ mod log;
 mod picker;
 mod remote;
 mod sse;
+mod usage;
 mod work;
 
 use gateway::{absorb_cookies, cookie_header, describe, endpoint, parse_origin, send, Error};
@@ -506,6 +507,48 @@ async fn transcribe(state: State<'_, AppState>, data_url: String) -> Result<Stri
     let request = state.dashboard(Method::POST, &["api", "audio", "transcribe"], &query)?.json(&json!({ "data_url": data_url }));
     let body = json_body(send(&state.slow_client, request).await?).await?;
     Ok(body["transcript"].as_str().unwrap_or_default().to_owned())
+}
+
+/// Sessions of the current Profile started in the last `days` days: per day, and in total with side calls.
+#[tauri::command]
+async fn usage_analytics(state: State<'_, AppState>, days: u32) -> Result<usage::Analytics, Error> {
+    if state.ssh() {
+        return Err(Error::Invalid("Over SSH, Hermes prints usage history only as text".into()));
+    }
+    let days = days.clamp(1, 365).to_string();
+    let profile = state.lock().profile.clone();
+    let mut query = vec![("days", days.as_str())];
+    query.extend(profile.as_deref().map(|p| ("profile", p)));
+    let body = state.dashboard_json(state.dashboard(Method::GET, &["api", "analytics", "usage"], &query)?).await?;
+    usage::analytics(body).map_err(|e| Error::Http(format!("Unreadable usage analytics: {e}")))
+}
+
+/// The current Profile's Sessions started in the past hour, summed from their API server records:
+/// the analytics route counts whole days only. Child Sessions count, as there.
+// ponytail: the newest 200 by activity, against this machine's clock; a busier hour undercounts.
+// Page with offset if it happens.
+#[tauri::command]
+async fn usage_past_hour(state: State<'_, AppState>) -> Result<usage::Tally, Error> {
+    if state.ssh() {
+        return Err(Error::Invalid("Over SSH, Hermes prints usage history only as text".into()));
+    }
+    let request = state.api(Method::GET, &["api", "sessions"], &[("limit", "200"), ("include_children", "true")])?;
+    let sessions = json_body(send(&state.client, request).await?).await?["data"].take();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+    usage::tally_since(sessions, now - 3600.0).map_err(|e| Error::Http(format!("Unreadable sessions: {e}")))
+}
+
+/// The Remaining limit of the current Profile's provider account. Only `hermes usage` reports it, so
+/// this runs it over a one-shot `ssh`, as ADR 0002 does for the Board and Skills.
+#[tauri::command]
+async fn usage_limit(state: State<'_, AppState>) -> Result<usage::Limit, Error> {
+    let (host, profile) = {
+        let inner = state.lock();
+        (inner.ssh_host.clone(), inner.profile.clone())
+    };
+    let host = host.ok_or_else(|| Error::Invalid("Remaining limit isn't available over HTTP".into()))?;
+    let body = remote::json(&remote::run(&host, remote::usage(profile.as_deref())).await?)?;
+    usage::limit(body).map_err(|e| Error::Http(format!("Unreadable hermes usage output: {e}")))
 }
 
 /// Answers an Approval request from Hermes over SSH; `None` denies by cancelling.
@@ -1145,6 +1188,9 @@ fn main() {
             set_profile,
             list_models,
             transcribe,
+            usage_analytics,
+            usage_past_hour,
+            usage_limit,
             answer_permission,
             list_sessions,
             session_messages,

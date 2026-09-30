@@ -4,6 +4,7 @@
 //
 //   node mock/server.mjs        Dashboard on :19119, API server on :18642
 //
+// Dashboard /api/analytics/usage sums the Sessions' usage; a fresh state seeds a few with usage.
 // Prompt keywords script the reply: "tool" (tool events), "idle" (12 s silence, so a 10 s
 // keepalive fires mid-stream), "slow" (long, slow reply for kill tests), "approval", "fail".
 // MOCK_TRANSCRIBE_MS delays speech-to-text (try 20000 to outlast the 15 s idle timeout).
@@ -33,6 +34,58 @@ const state = existsSync(STATE_FILE)
   : { sessions: {}, messages: {}, access: {}, refresh: {} };
 const save = () => writeFileSync(STATE_FILE, JSON.stringify(state, null, 1));
 const runs = new Map();
+
+// With no Sessions yet, a few from earlier with usage, so the Usage view has history. The last is
+// older than 30 days, so no range counts it. Mock Runs themselves record no usage.
+// Side calls (compression, titles, …) live apart from the Session counters, as in session_model_usage.
+const SIDE_CALLS = { sess_seed2: [{ task: "compression", input_tokens: 60_000, output_tokens: 3_000, estimated_cost: 0.09 }] };
+if (!Object.keys(state.sessions).length) {
+  const ago = (hours) => Date.now() / 1000 - hours * 3600;
+  const seeds = [
+    ["default", 1 / 3, "Fix the backup cron", 12_400, 1_830, 40_200, 0.0712],
+    ["default", 5, "Summarize the router logs", 88_000, 9_100, 310_000, 0.4135],
+    ["default", 72, "Plan the Chromebook refresh", 240_000, 18_000, 1_200_000, 1.62],
+    ["default", 12 * 24, "Draft the staff newsletter", 51_000, 4_000, 90_000, 0.2375],
+    ["default", 40 * 24, "Old session", 999_999, 99_999, 0, 9.99],
+    ["orchestrator", 2, "Route the Kanban tasks", 5_000, 700, 0, 0.0255],
+  ];
+  for (const [i, [profile, hours, title, input, output, cached, cost]] of seeds.entries()) {
+    const id = `sess_seed${i}`;
+    state.sessions[id] = {
+      id, source: "cli", profile, title, model: "mock-large", started_at: ago(hours), ended_at: ago(hours) + 600, last_active: ago(hours) + 600,
+      message_count: 2, tool_call_count: 0, parent_session_id: null, preview: title, pinned: false, archived: false,
+      input_tokens: input, output_tokens: output, cache_read_tokens: cached, cache_write_tokens: 0, reasoning_tokens: 0,
+      estimated_cost_usd: cost, actual_cost_usd: null, api_call_count: 3,
+    };
+    state.messages[id] = [
+      { id: 1, session_id: id, role: "user", content: title, tool_call_id: null, tool_calls: null, timestamp: ago(hours) },
+      { id: 2, session_id: id, role: "assistant", content: `Done: ${title.toLowerCase()}.`, tool_call_id: null, tool_calls: null, timestamp: ago(hours) + 600 },
+    ];
+  }
+  save();
+}
+
+// Like web_routers/analytics.py: the Profile's Sessions started in the last `days` days, summed per
+// local day and in total. SQL's SUM over no rows is null, and the costs are COALESCEd to 0.
+function usageAnalytics(url) {
+  const days = Math.min(Math.max(Number(url.searchParams.get("days") ?? 30), 1), 365);
+  const profile = url.searchParams.get("profile") ?? "default";
+  const rows = Object.values(state.sessions).filter((s) => (s.profile ?? "default") === profile && s.started_at > now() - days * 86400);
+  const sum = (list, key) => (list.length ? list.reduce((n, s) => n + (s[key] ?? 0), 0) : null);
+  const tally = (list) => ({
+    input_tokens: sum(list, "input_tokens"), output_tokens: sum(list, "output_tokens"),
+    cache_read_tokens: sum(list, "cache_read_tokens"), reasoning_tokens: sum(list, "reasoning_tokens"),
+    estimated_cost: sum(list, "estimated_cost_usd") ?? 0, actual_cost: sum(list, "actual_cost_usd") ?? 0,
+    sessions: list.length, api_calls: sum(list, "api_call_count"),
+  });
+  // total_input, total_cache_read, total_estimated_cost, …
+  const totals = Object.fromEntries(Object.entries(tally(rows)).map(([k, v]) => [`total_${k.replace("_tokens", "")}`, v]));
+  const byDay = {};
+  for (const s of rows) (byDay[new Date(s.started_at * 1000).toLocaleDateString("sv-SE")] ??= []).push(s);
+  const daily = Object.keys(byDay).sort().map((day) => ({ day, ...tally(byDay[day]) }));
+  const byTask = rows.flatMap((s) => SIDE_CALLS[s.id] ?? []).map((c) => ({ ...c, api_calls: 1, models: ["mock-small"] }));
+  return { daily, by_model: [], by_task: byTask, totals, period_days: days, skills: {}, tools: {} };
+}
 
 const newId = (prefix) => prefix + randomBytes(8).toString("hex");
 const now = () => Date.now() / 1000;
@@ -133,6 +186,7 @@ serve(DASH_PORT, "dashboard", async (req, res, url) => {
     return send(res, 200, { sessions: rows.sort((x, y) => y.last_active - x.last_active), total: rows.length });
   }
   if (route === "GET /api/profiles/active") return send(res, 200, { active: "orchestrator", current: "default" });
+  if (route === "GET /api/analytics/usage") return send(res, 200, usageAnalytics(url));
   if (route === "POST /api/audio/transcribe") {
     const body = await readJson(req);
     if (!body?.data_url?.startsWith("data:audio/") && !body?.data_url?.startsWith("data:video/webm")) {
