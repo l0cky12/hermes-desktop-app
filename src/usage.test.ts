@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { addUsage, compact, describeCost, describeUsage, runUsage, sessionUsage } from "./usage.ts";
+import { addUsage, compact, describeCost, describeUsage, dollars, percentLeft, runUsage, sessionUsage } from "./usage.ts";
 
 test("numbers are compact", () => {
   assert.deepEqual([0, 950, 1234, 12_000, 3_400_000].map(compact), ["0", "950", "1.2k", "12k", "3.4M"]);
@@ -31,4 +31,18 @@ test("cost is Hermes's estimate, and $0 means Hermes has no price for the model"
   assert.equal(describeCost(0.99996), "≈ $1.00");
   assert.equal(describeCost(0), null);
   assert.equal(describeCost(null), null); // a Session with no Turns yet
+});
+
+test("spend shows cents, and sub-dollar amounts to four places", () => {
+  assert.equal(dollars(0), "$0.00");
+  assert.equal(dollars(0.25), "$0.25");
+  assert.equal(dollars(0.0042), "$0.0042");
+  assert.equal(dollars(0.123456), "$0.1235");
+  assert.equal(dollars(1234.5), "$1,234.50");
+});
+
+test("the share of a limit window left, from Hermes's used percent", () => {
+  assert.equal(percentLeft(65.510374511), 34);
+  assert.equal(percentLeft(0), 100);
+  assert.equal(percentLeft(120), 0);
 });

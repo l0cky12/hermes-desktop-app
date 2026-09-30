@@ -1,7 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { field, h, icon, input } from "./dom";
-import { dollars, percentLeft, tokens } from "./usage-format";
 import { appearanceTab, applyAppearance } from "./appearance";
 import { exportHtml, exportMarkdown, fileName, textParts, transcriptTurns, type Message } from "./export";
 import {
@@ -9,7 +8,7 @@ import {
   type Choice, type ModelChoice,
 } from "./prefs";
 import { transcriptMarkdown } from "./transcript";
-import { addUsage, describeCost, describeUsage, runUsage, sessionUsage, type SessionTotals, type Usage } from "./usage";
+import { addUsage, compact, describeCost, describeUsage, dollars, percentLeft, runUsage, sessionUsage, type SessionTotals, type Usage } from "./usage";
 
 type GatewayError = { kind: "unreachable" | "unauthorized" | "not_found" | "http" | "invalid"; message: string };
 type Init = { dashboard_url: string | null; api_url: string | null; ssh_host: string | null; keyring: boolean };
@@ -1987,15 +1986,15 @@ function usageView(): View {
     const sideCost = side.estimated_cost > 0 ? `, incl. ${dollars(side.estimated_cost)} side calls` : "";
     stats.replaceChildren(
       stat("Spend", dollars(totals.estimated_cost), `$${+totals.estimated_cost.toFixed(6)}`, `Hermes's estimate${sideCost}`),
-      stat("Tokens in", tokens(totals.input_tokens), count(totals.input_tokens),
-        totals.cache_read_tokens > 0 ? `+ ${tokens(totals.cache_read_tokens)} read from cache` : ""),
-      stat("Tokens out", tokens(totals.output_tokens), count(totals.output_tokens)),
+      stat("Tokens in", compact(totals.input_tokens), count(totals.input_tokens),
+        totals.cache_read_tokens > 0 ? `+ ${compact(totals.cache_read_tokens)} read from cache` : ""),
+      stat("Tokens out", compact(totals.output_tokens), count(totals.output_tokens)),
       stat("Sessions", count(totals.sessions), count(totals.sessions)),
     );
     const table = days >= 7 && perDay.length > 0;
     daily.replaceChildren(...(table ? [
       h("tr", {}, ...["Day", "Spend", "In", "Out", "Sessions"].map((c) => h("th", { textContent: c }))),
-      ...[...perDay].reverse().map((d) => h("tr", {}, ...[d.day, dollars(d.estimated_cost), tokens(d.input_tokens), tokens(d.output_tokens), count(d.sessions)]
+      ...[...perDay].reverse().map((d) => h("tr", {}, ...[d.day, dollars(d.estimated_cost), compact(d.input_tokens), compact(d.output_tokens), count(d.sessions)]
         .map((c) => h("td", { textContent: c })))),
     ] : []));
     dailyNote.hidden = !table || !(side.input_tokens || side.output_tokens);
