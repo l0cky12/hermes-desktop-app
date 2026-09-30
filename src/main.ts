@@ -519,7 +519,20 @@ async function addImage(name: string, image: Blob) {
 /** Photos and screenshots are often too big, or an unsendable type: re-encode as JPEG, shrinking until one fits. */
 async function fitImage(name: string, blob: Blob, limit: number): Promise<Blob> {
   if (blob.size <= limit && SENDABLE.includes(blob.type)) return blob;
-  const bitmap = await createImageBitmap(blob);
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(blob);
+  } catch {
+    throw new Error(`${name}: not an image this app can send`);
+  }
+  try {
+    return await shrink(name, bitmap, limit);
+  } finally {
+    bitmap.close();
+  }
+}
+
+async function shrink(name: string, bitmap: ImageBitmap, limit: number): Promise<Blob> {
   for (const scale of [1, 0.75, 0.5, 0.35, 0.25]) {
     const canvas = h("canvas", { width: Math.round(bitmap.width * scale), height: Math.round(bitmap.height * scale) });
     const ctx = canvas.getContext("2d")!;

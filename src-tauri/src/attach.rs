@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 /// 4/3 their size: 7,000,000 bytes of images is 9,333,334 in the body, leaving ~0.67 MB for the typed
 /// text and the JSON around it. SSH (ACP) has no cap; it gets the same budget so both modes behave alike.
 pub const MAX_TOTAL_BYTES: u64 = 7_000_000;
+/// A dropped image bigger than this is refused outright rather than read into memory to shrink.
+pub const MAX_SHRINKABLE_BYTES: u64 = 50_000_000;
 
 /// Where an Attachment's bytes come from: a path dropped on the window (checked against the
 /// drop list), or bytes the webview already holds (the paperclip picker, a pasted image).
@@ -54,7 +56,7 @@ pub fn build_input(text: &str, files: &[Source]) -> Result<Value, String> {
     let mut left = MAX_TOTAL_BYTES;
     for file in files {
         let (name, bytes) = read(file, left)?;
-        left -= bytes.len() as u64;
+        left = left.saturating_sub(bytes.len() as u64);
         if let Some(mime) = image_mime(Path::new(&name)) {
             let url = format!("data:{mime};base64,{}", STANDARD.encode(&bytes));
             images.push(json!({ "type": "image_url", "image_url": { "url": url } }));
@@ -83,6 +85,10 @@ pub fn build_input(text: &str, files: &[Source]) -> Result<Value, String> {
 /// isn't an image.
 pub fn dropped_image(path: &Path) -> Result<Option<String>, String> {
     let Some(mime) = image_mime(path) else { return Ok(None) };
+    let size = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?.len();
+    if size > MAX_SHRINKABLE_BYTES {
+        return Err(format!("{}: too large to shrink (over 50 MB)", path.display()));
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(Some(format!("data:{mime};base64,{}", STANDARD.encode(bytes))))
 }

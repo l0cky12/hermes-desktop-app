@@ -558,7 +558,7 @@ async fn delete_session(state: State<'_, AppState>, id: String) -> Result<(), Er
 
 /// Hands a dropped image to the webview to shrink to fit (`None` for other files, which stay paths).
 #[tauri::command]
-fn read_dropped(state: State<'_, AppState>, path: PathBuf) -> Result<Option<String>, Error> {
+async fn read_dropped(state: State<'_, AppState>, path: PathBuf) -> Result<Option<String>, Error> {
     if !state.dropped.lock().unwrap().contains(&path) {
         return Err(Error::Invalid(format!("{} was not dropped into this window", path.display())));
     }
