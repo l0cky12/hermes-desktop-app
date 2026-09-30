@@ -98,8 +98,9 @@ struct AppState {
     hermes: tokio::sync::Mutex<Option<Arc<acp::Conn>>>,
     /// SSH-mode Runs by run id: their Session, and the prompt until `stream_run` sends it.
     acp_runs: Mutex<HashMap<String, AcpRun>>,
-    /// Over SSH: each listed Skill's SKILL.md path, so reading one never takes a path from the webview.
-    skill_paths: Mutex<HashMap<String, String>>,
+    /// Over SSH, per host: each listed Skill's SKILL.md path, so reading one never takes a path
+    /// from the webview, nor a path listed on another host.
+    skill_paths: Mutex<HashMap<String, HashMap<String, String>>>,
 }
 
 struct AcpRun {
@@ -824,7 +825,7 @@ async fn skills_list(state: State<'_, AppState>) -> Result<Vec<work::Skill>, Err
     if let Some(host) = state.ssh_host() {
         let output = remote::run(&host, remote::skills_list()).await?;
         let (skills, paths) = work::skills_from_ssh(&output).ok_or_else(|| Error::Http("hermes printed no profile home".into()))?;
-        *state.skill_paths.lock().unwrap() = paths;
+        state.skill_paths.lock().unwrap().insert(host, paths);
         return Ok(skills);
     }
     Ok(work::skills_from_dashboard(state.dashboard_json(state.dashboard(Method::GET, &["api", "skills"], &[])?).await?))
@@ -834,7 +835,7 @@ async fn skills_list(state: State<'_, AppState>) -> Result<Vec<work::Skill>, Err
 #[tauri::command]
 async fn skill_content(state: State<'_, AppState>, name: String) -> Result<String, Error> {
     if let Some(host) = state.ssh_host() {
-        let path = state.skill_paths.lock().unwrap().get(&name).cloned();
+        let path = state.skill_paths.lock().unwrap().get(&host).and_then(|paths| paths.get(&name)).cloned();
         let path = path.ok_or_else(|| Error::NotFound(format!("No skill named {name}")))?;
         return remote::run(&host, remote::skill_content(&path)).await;
     }

@@ -1322,6 +1322,7 @@ function skillsView(): View {
   // A refresh that overlaps a toggle may predate its write, so it's dropped if a list is showing.
   let settled = 0; // toggles finished
   let pending = 0; // toggles in flight
+  let refreshes = 0; // only the latest refresh lands, so an older list can't overwrite a newer one
   const collapsed = new Set<string>();
   const search = input({ type: "search", placeholder: "Search skills…", required: false });
   const list = h("div", { className: "skill-list" });
@@ -1421,18 +1422,19 @@ function skillsView(): View {
 
   async function refresh(forKey: string) {
     const seen = settled;
+    const ticket = ++refreshes;
     try {
       const fresh = await call<Skill[]>("skills_list");
+      if (ticket !== refreshes) return;
+      if (forKey === key) error.textContent = "";
       if ((settled !== seen || pending) && skillsCache.has(forKey)) return;
       // Unchanged: keep the shown rows (and the objects their switches update) rather than redraw.
       const same = JSON.stringify(skillsCache.get(forKey)) === JSON.stringify(fresh);
       if (!same) skillsCache.set(forKey, fresh);
-      if (forKey !== key) return;
-      error.textContent = "";
-      if (same) return;
+      if (forKey !== key || same) return;
       skills = fresh;
     } catch (e) {
-      if (forKey !== key) return;
+      if (ticket !== refreshes || forKey !== key) return;
       error.textContent = `Couldn't load skills: ${asError(e).message}`;
     }
     render();
