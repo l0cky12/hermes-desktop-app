@@ -6,6 +6,7 @@ mod picker;
 mod remote;
 mod sse;
 mod usage;
+mod title;
 mod work;
 
 use gateway::{absorb_cookies, cookie_header, describe, endpoint, parse_origin, send, Error};
@@ -630,6 +631,49 @@ async fn pin_session(state: State<'_, AppState>, id: String, pinned: bool) -> Re
     send(&state.client, request).await.map(drop)
 }
 
+/// Retitle: asks the model for a title from the transcript, saves it, and returns it. Hermes
+/// has no endpoint for this, so the model is asked like any client would: a chat completion
+/// over HTTP, `hermes chat` over SSH. Either way Hermes stores the question as a Session of its
+/// own, which is deleted before the title is saved so it can't be holding that title.
+#[tauri::command]
+async fn retitle_session(state: State<'_, AppState>, id: String) -> Result<String, Error> {
+    if state.acp_runs.lock().unwrap().values().any(|r| r.session == id) {
+        // Loading the transcript over ACP would take the streaming reply's updates.
+        return Err(Error::Invalid("Over SSH, a session can be retitled once its reply finishes".into()));
+    }
+    let profile = state.lock().profile.clone();
+    // The model may take a minute; if the Profile changed meanwhile, the scratch delete and the
+    // rename would otherwise go out under the new Profile's key.
+    let same_profile = || (state.lock().profile == profile).then_some(()).ok_or_else(|| Error::Invalid("The profile changed while retitling".into()));
+    let messages = session_messages(state.clone(), id.clone()).await?;
+    let prompt = title::prompt(messages.as_array().map_or(&[][..], Vec::as_slice))
+        .ok_or_else(|| Error::Invalid("This session has no messages to title yet".into()))?;
+    let no_title = || Error::Http("The model didn't reply with a usable title".into());
+    if let Some(host) = state.ssh_host() {
+        let result = remote::chat_result(&remote::run(&host, remote::ask(profile.as_deref(), &prompt)).await?)?;
+        same_profile()?;
+        if let Some(scratch) = result["session_id"].as_str().filter(|s| !s.is_empty() && *s != id) {
+            let _ = remote::run(&host, remote::sessions_delete(profile.as_deref(), scratch)).await;
+        }
+        let title = title::clean(result["text"].as_str().unwrap_or_default()).ok_or_else(no_title)?;
+        remote::run(&host, remote::sessions_rename(profile.as_deref(), &id, &title)).await?;
+        return Ok(title);
+    }
+    let body = json!({ "messages": [{ "role": "user", "content": prompt }] });
+    let request = state.api(Method::POST, &["v1", "chat", "completions"], &[])?.json(&body);
+    let response = send(&state.slow_client, request).await?;
+    let scratch = response.headers().get("X-Hermes-Session-Id").and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let reply = json_body(response).await?["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_owned();
+    same_profile()?;
+    if let Some(scratch) = scratch.filter(|s| *s != id) {
+        let _ = send(&state.client, state.api(Method::DELETE, &["api", "sessions", &scratch], &[])?).await;
+    }
+    let title = title::clean(&reply).ok_or_else(no_title)?;
+    let request = state.api(Method::PATCH, &["api", "sessions", &id], &[])?.json(&json!({ "title": title }));
+    send(&state.client, request).await?;
+    Ok(title)
+}
+
 #[tauri::command]
 async fn delete_session(state: State<'_, AppState>, id: String) -> Result<(), Error> {
     if state.ssh() {
@@ -1202,6 +1246,7 @@ fn main() {
             archived_sessions,
             duplicate_session,
             save_file,
+            retitle_session,
             start_run,
             stream_run,
             stop_run,

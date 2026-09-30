@@ -1015,6 +1015,11 @@ function renderSessionUsage() {
     : "";
 }
 
+/** Retitle: the model names the Session from its transcript, and the list shows the new title. */
+function retitleSession(id: string) {
+  return sessionAction("retitle the session", () => invoke("retitle_session", { id }));
+}
+
 async function refreshSessions() {
   try {
     sessions = await invoke<Session[]>(archivedView ? "archived_sessions" : "list_sessions");
@@ -1109,6 +1114,7 @@ function toggleSessionMenu(s: Session, more: HTMLElement, title: HTMLElement) {
     "div",
     { className: "menu session-menu", onclick: (e) => e.stopPropagation() },
     act("Rename", () => renameSession(s, title)),
+    act("Retitle", () => retitleSession(s.id)),
     act("Duplicate", () => sessionAction("duplicate the session", async () => void openSession(await invoke<string>("duplicate_session", { id: s.id, title: `${sessionTitle(s)} (copy)` })))),
     ...(overSsh ? [] : [act(archive ? "Archive" : "Unarchive", () => sessionAction(`${archive ? "archive" : "unarchive"} the session`, async () => {
       await invoke("archive_session", { id: s.id, archived: archive });

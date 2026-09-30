@@ -101,6 +101,9 @@ _Avoid_: cancel, abort
 **Usage**:
 The tokens a Turn or Session consumed (input, output, and the share of input read from the prompt cache), plus, for a Session, what they cost in dollars.
 _Avoid_: stats, billing, credits
+**Retitle**:
+Asking the model for a new Session title based on the transcript, which replaces the current title.
+_Avoid_: regenerate (that's for replies), rename (a title the user types)
 
 **Approval request**:
 A Run pausing until a human allows or denies a risky command; this client can answer it only over SSH.

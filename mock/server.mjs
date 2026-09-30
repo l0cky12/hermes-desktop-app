@@ -524,6 +524,24 @@ serve(API_PORT, "api", async (req, res, url) => {
       return send(res, 200, { run_id: id, status: "stopping" });
     }
   }
+  if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+    // Non-streaming only. Like Hermes, the completion is kept as a Session of its own, named in
+    // X-Hermes-Session-Id. A title prompt gets `Title: "<its opening words>"` back.
+    const body = await readJson(req);
+    const text = body?.messages?.at(-1)?.content;
+    if (typeof text !== "string" || !text) return send(res, 400, { error: { message: "No user message found in messages", type: "invalid_request_error" } });
+    const sessionId = `api-${randomBytes(8).toString("hex")}`;
+    touchSession(sessionId, text.slice(0, 60), profile);
+    addMessage(sessionId, "user", text);
+    const opening = text.match(/^User: (.*)$/m)?.[1];
+    const reply = opening ? `Title: "${opening.split(" ").slice(0, 5).join(" ")} (retitled)"` : `You said: ${text.slice(0, 80)}`;
+    addMessage(sessionId, "assistant", reply);
+    return send(res, 200, {
+      id: newId("chatcmpl-"), object: "chat.completion", created: Math.floor(now()), model: body.model ?? "hermes-agent",
+      choices: [{ index: 0, message: { role: "assistant", content: reply }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 40, completion_tokens: 8, total_tokens: 48 },
+    }, { "X-Hermes-Session-Id": sessionId });
+  }
   if (req.method === "GET" && url.pathname === "/api/model/options") {
     if (env.MOCK_NO_MODELS === "1") return send(res, 500, { error: { message: "Failed to list model options.", code: "model_options_failed" } });
     return send(res, 200, { provider: "mockai", model: "mock-large", providers: [
@@ -555,6 +573,8 @@ serve(API_PORT, "api", async (req, res, url) => {
     if (route === "PATCH /api/sessions/:id") {
       const body = (await readJson(req)) ?? {};
       if ("pinned" in body && typeof body.pinned !== "boolean") return send(res, 400, { error: { message: "'pinned' must be a boolean", code: "invalid_session_field" } });
+      const taken = body.title && Object.values(state.sessions).find((s) => s.id !== id && s.title === body.title);
+      if (taken) return send(res, 400, { error: { message: `Title '${body.title}' is already in use by session ${taken.id}`, type: "invalid_request_error", code: "invalid_title" } });
       if ("title" in body) session.title = body.title;
       if ("pinned" in body) session.pinned = body.pinned;
       if ("archived" in body) {

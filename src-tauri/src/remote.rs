@@ -1,4 +1,4 @@
-//! One-shot `ssh <host> hermes …` commands for the Board, Skills, and MCP servers (ADR 0002), separate from
+//! One-shot `ssh <host> hermes …` commands for the Board, Skills, MCP servers, and Retitle (ADR 0002), separate from
 //! the long-lived `hermes acp` connection. Every argument reaches the remote POSIX shell, so
 //! each one is single-quoted; Task bodies go on stdin, never on the command line.
 
@@ -186,6 +186,28 @@ fn profile_home(profile: Option<&str>) -> String {
     format!("home=$({} config path | tail -n 1) && home=${{home%/*}} || exit 1", bin(profile))
 }
 
+pub fn sessions_delete(profile: Option<&str>, id: &str) -> Cmd {
+    hermes_as(profile, "hermes sessions delete", &["--yes".into(), "--".into(), id.into()])
+}
+
+/// One question to the model, as `hermes chat` reads it from stdin; `chat_result` reads the answer.
+/// No one can answer an Approval request there, so its only toolset is `todo`, which can't touch
+/// the host. Hermes keeps its Session out of listings but still stores it.
+pub fn ask(profile: Option<&str>, prompt: &str) -> Cmd {
+    let mut cmd = hermes_as(profile, "hermes chat", &["--format=stream-json".into(), "--toolsets=todo".into(), "--query-file".into(), "-".into()]);
+    cmd.stdin = Some(prompt.to_owned());
+    cmd
+}
+
+/// The closing `{"type":"result", "session_id", "text", …}` line of `hermes chat --format=stream-json`.
+pub fn chat_result(stdout: &str) -> Result<Value, Error> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok().filter(|v| v["type"] == "result"))
+        .ok_or_else(|| Error::Http("hermes chat printed no result".into()))
+}
+
 /// `hermes [-p P] sessions rename -- <id> <title>`: the title stays one argument, so its spacing survives.
 pub fn sessions_rename(profile: Option<&str>, id: &str, title: &str) -> Cmd {
     hermes_as(profile, "hermes sessions rename", &["--".into(), id.into(), title.into()])
@@ -317,6 +339,19 @@ mod tests {
             let cmd = sessions_rename(Some("coder"), "-s_1", title);
             assert_eq!(argv_seen_by_hermes(&cmd), ["-p", "coder", "sessions", "rename", "--", "-s_1", title]);
         }
+    }
+
+    #[test]
+    fn retitling_asks_hermes_with_the_prompt_on_stdin_then_cleans_up_and_renames_as_the_profile() {
+        for text in NASTY {
+            let cmd = ask(Some("coder"), text);
+            assert_eq!(argv_seen_by_hermes(&cmd), ["-p", "coder", "chat", "--format=stream-json", "--toolsets=todo", "--query-file", "-"]);
+            assert_eq!(cmd.stdin.as_deref(), Some(text));
+            let cmd = sessions_rename(Some("coder"), "-s_1", text);
+            assert_eq!(argv_seen_by_hermes(&cmd), ["-p", "coder", "sessions", "rename", "--", "-s_1", text]);
+            assert_eq!(argv_seen_by_hermes(&sessions_delete(Some("coder"), text)), ["-p", "coder", "sessions", "delete", "--yes", "--", text]);
+        }
+        assert_eq!(argv_seen_by_hermes(&ask(None, "t"))[0], "chat");
         assert_eq!(argv_seen_by_hermes(&sessions_rename(None, "s", "a  b")), ["sessions", "rename", "--", "s", "a  b"]);
     }
 
@@ -329,6 +364,15 @@ mod tests {
         assert_eq!(argv_seen_by_hermes(&kanban_assignees(Some("ops"))), ["kanban", "--board=ops", "assignees", "--json"]);
         assert_eq!(argv_seen_by_hermes(&kanban_boards()), ["kanban", "boards", "list", "--json"]);
         assert_eq!(kanban_list(Some("ops")).summary, "hermes kanban list");
+    }
+
+    #[test]
+    fn the_chat_result_is_the_last_result_line() {
+        let stdout = "hermes: updating...\n{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}\n\
+                      {\"type\":\"text\",\"text\":\"Printer\"}\n{\"type\":\"result\",\"session_id\":\"s1\",\"exit_code\":0,\"text\":\"Printer jams\"}\n";
+        let result = chat_result(stdout).unwrap();
+        assert_eq!((result["session_id"].as_str(), result["text"].as_str()), (Some("s1"), Some("Printer jams")));
+        assert!(chat_result("{\"type\":\"text\",\"text\":\"x\"}\n").is_err());
     }
 
     #[test]

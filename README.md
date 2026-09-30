@@ -63,11 +63,14 @@ The Sessions panel lists the active Profile's Sessions, newest first. The pin bu
 Each Session in the Sessions panel has a ⋯ menu:
 
 - **Rename** edits the title in place (Enter saves, Escape cancels).
+- **Retitle** asks the model for a title; see below.
 - **Duplicate** copies the whole transcript into a new Session titled "… (copy)" and opens it. Over HTTP, Hermes marks the original as ended ("branched"); you can keep chatting in it.
 - **Archive** hides a Session from the list without deleting it. **Archived** at the bottom of the panel lists archived Sessions (from the Dashboard), where **Unarchive** brings one back.
 - **Export as Markdown / HTML** saves the transcript wherever you pick. That's also how to share a Session: Hermes has no share links.
 - **Export as PDF** opens the Session and the system print dialog; pick "Print to File" or "Save as PDF". Only the title and Turns print.
 - Over SSH, Archive and Delete aren't offered: `hermes sessions archive` only works in bulk, and ACP can't delete.
+
+**Retitle** on a Session asks the model for a new title based on the transcript (the opening message and as much of the latest as fits in about 6,000 characters) and saves it as the Session's title. Hermes has no endpoint for this, so the app asks on the Profile's default model the way any client would: over HTTP with a chat completion (`POST /v1/chat/completions`), which runs as one agent turn with the API server's usual tools, since a request can't turn them off; over SSH with `hermes chat --query-file -`, limited to the `todo` toolset because no one is there to answer an Approval request. Hermes stores that question as a Session of its own, so the app deletes it (`DELETE /api/sessions/{id}` or `hermes sessions delete`) before saving the title (`PATCH /api/sessions/{id}` or `hermes sessions rename`). Hermes titles are unique, so a title another Session already has is refused.
 
 ## Profiles, models, and reasoning
 
