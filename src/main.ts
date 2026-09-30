@@ -500,11 +500,23 @@ async function fitImage(blob: Blob): Promise<Blob> {
 
 /** Pasted images become Attachments; any text in the clipboard still pastes as usual. */
 async function pasteImages(e: ClipboardEvent) {
-  const images = [...(e.clipboardData?.items ?? [])]
+  // WebKitGTK can list no types even for plain text, but getData still finds it; that pastes as usual.
+  const text = e.clipboardData?.getData("text/plain");
+  const images: Blob[] = [...(e.clipboardData?.items ?? [])]
     .filter((i) => i.kind === "file" && i.type.startsWith("image/"))
     .map((i) => i.getAsFile())
     .filter((f): f is File => f !== null);
-  if (!images.length || !runs) return;
+  if (!runs) return;
+  if (!images.length && !text) {
+    // Maybe a screenshot WebKitGTK hid from the page: Rust reads it. Its own paste would race ours (xclip serves one at a time).
+    e.preventDefault();
+    try {
+      const png = await invoke<ArrayBuffer>("clipboard_image");
+      if (png.byteLength) images.push(new Blob([png], { type: "image/png" }));
+    } catch (err) {
+      ui!.composerError.textContent = `Not attached: ${asError(err).message}`;
+    }
+  }
   for (const image of images) {
     try {
       const fitted = await fitImage(image);

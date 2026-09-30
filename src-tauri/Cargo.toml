@@ -22,3 +22,5 @@ tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macr
 [target.'cfg(target_os = "linux")'.dependencies]
 # Dictation needs getUserMedia, which WebKitGTK ships switched off; same crate Tauri already uses.
 webkit2gtk = { version = "2", features = ["v2_40"] }
+# Pasted screenshots: WebKitGTK hides raw clipboard images from the page, so Rust reads them; same crate Tauri already uses.
+gtk = "0.18"

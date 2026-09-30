@@ -99,6 +99,7 @@ The API server has no upload endpoint, so Attachments ride inside the Run reques
 - Images (`png`, `jpg`, `gif`, `webp`) are sent as `image_url` data-URL parts.
 - Other file types, and files over 2 MB, are refused with an inline "Not sent" error.
 - Pasted images over 2 MB, or in a format that can't be sent, are re-encoded as JPEG and scaled down until they fit.
+- Screenshots and other raw clipboard images paste too; on Linux the app reads them from the system clipboard as PNG, since the webview can't.
 
 ## Testing against the mock gateway
 
