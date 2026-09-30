@@ -3,7 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { field, h, icon, input } from "./dom";
 import { appearanceTab, applyAppearance } from "./appearance";
 import {
-  changeLabel, choiceKey, DEFAULT_CHOICE, loadChoice, REASONING_LEVELS, saveChoice, saveProfile, startProfile,
+  changeLabel, choiceKey, DEFAULT_CHOICE, loadChoice, REASONING_LEVELS, saveBoard, saveChoice, saveProfile, startBoard, startProfile,
   type Choice, type ModelChoice,
 } from "./prefs";
 
@@ -316,7 +316,7 @@ function reauth(kind: "sign-in" | "key", reason: string, cancel?: string): Promi
 // ---- Chat ----
 
 let runs = false; // the API server accepts Runs and streams their events
-let connection = ""; // which Gateway or SSH host; Profiles and per-Session choices are remembered per connection
+let connection = ""; // which Gateway or SSH host; Profiles, Boards, and per-Session choices are remembered per connection
 let profile = "default";
 const connectionId = (dash: string, api: string) => `${new URL(dash).origin}|${new URL(api).origin}`;
 let signInRequired = true; // the Dashboard asks for Sign-in; without it, a 401 can't be fixed by signing in
@@ -1062,6 +1062,7 @@ function setOptions(el: HTMLSelectElement, options: string[], all: string) {
 type Task = { id: string; title: string; body: string | null; assignee: string | null; status: string; priority: number; tenant: string | null; created_at: number | null };
 type Comment = { author: string; body: string; created_at: number };
 type Detail = { task: Task; comments: Comment[] };
+type Boards = { boards: { slug: string; name: string }[]; current: string | null };
 
 const STATUSES = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"];
 const HIDDEN_WHEN_EMPTY = new Set(["scheduled", "review"]);
@@ -1072,6 +1073,41 @@ function kanbanView(): View {
   let assignees: string[] = [];
   let status = ""; // the status chip filter, "" for all
   let timer: number | undefined;
+  let board: string | null = null; // the chosen Board's slug; `null` is the host's current Board
+
+  /** A Board command on the chosen Board, never by changing the host's own current Board. */
+  const kanban = <T>(cmd: string, args: Record<string, unknown> = {}) => call<T>(cmd, { board, ...args });
+
+  const boardPicker = h("select", { onchange: () => useBoard(boardPicker.value) });
+  boardPicker.setAttribute("aria-label", "Board");
+
+  /** Lists the host's Boards and picks the one last chosen on this connection, else the host's current Board. */
+  async function loadBoards() {
+    assignees = []; // the Board may differ from the last load, and each Board knows its own
+    try {
+      const list = await call<Boards>("kanban_boards");
+      boardPicker.replaceChildren(...list.boards.map((b) => h("option", { value: b.slug, textContent: b.name || b.slug })));
+      board = startBoard(localStorage, connection, list.boards.map((b) => b.slug), list.current);
+      boardPicker.value = board;
+      boardPicker.title = "Board";
+    } catch (e) {
+      board = null;
+      boardPicker.replaceChildren(h("option", { textContent: "Current board" }));
+      boardPicker.title = `Couldn't list boards: ${asError(e).message}`;
+    }
+    boardPicker.disabled = board === null;
+  }
+
+  function useBoard(slug: string) {
+    board = slug;
+    saveBoard(localStorage, connection, slug);
+    assignees = []; // each Board knows its own
+    tasks = [];
+    lastDispatch.textContent = "";
+    drawer.hidden = true;
+    render();
+    void load();
+  }
 
   const search = input({ type: "search", placeholder: "Search tasks", required: false });
   const assignee = select([], "All assignees");
@@ -1094,7 +1130,7 @@ function kanbanView(): View {
   async function create(task: Record<string, unknown>, errorEl: HTMLElement): Promise<boolean> {
     errorEl.textContent = "";
     try {
-      await call("kanban_create", { task });
+      await kanban("kanban_create", { task });
     } catch (e) {
       errorEl.textContent = `Couldn't create the task: ${asError(e).message}`;
       return false;
@@ -1145,7 +1181,7 @@ function kanbanView(): View {
   async function dispatch(dryRun: boolean, errorEl: HTMLElement): Promise<string | null> {
     errorEl.textContent = "";
     try {
-      const result = summarize(await call("kanban_dispatch", { dryRun }));
+      const result = summarize(await kanban("kanban_dispatch", { dryRun }));
       if (!dryRun) await load();
       return result;
     } catch (e) {
@@ -1187,12 +1223,16 @@ function kanbanView(): View {
   };
 
   async function load() {
+    const loading = board;
     try {
-      // Profiles rarely change: fetched once, not on every 30 s refresh.
-      if (!assignees.length) assignees = await call<string[]>("kanban_assignees").catch(() => []);
-      tasks = await call<Task[]>("kanban_board");
+      // Profiles rarely change: fetched once per Board, not on every 30 s refresh.
+      const names = assignees.length ? assignees : await kanban<string[]>("kanban_assignees").catch(() => []);
+      const list = await kanban<Task[]>("kanban_board");
+      if (loading !== board) return; // another Board was picked meanwhile; its own load shows it
+      [assignees, tasks] = [names, list];
       error.textContent = "";
     } catch (e) {
+      if (loading !== board) return;
       error.textContent = `Couldn't load the board: ${asError(e).message}`;
     }
     render();
@@ -1246,7 +1286,7 @@ function kanbanView(): View {
     drawer.replaceChildren(h("p", { className: "loading", textContent: "Loading…" }));
     let detail: Detail;
     try {
-      detail = await call<Detail>("kanban_task", { id });
+      detail = await kanban<Detail>("kanban_task", { id });
     } catch (e) {
       drawer.replaceChildren(closeButton(), h("p", { className: "error", textContent: `Couldn't load ${id}: ${asError(e).message}` }));
       return;
@@ -1259,7 +1299,7 @@ function kanbanView(): View {
       if (!text.value.trim()) return;
       add.disabled = true;
       try {
-        await call("kanban_comment", { id, text: text.value });
+        await kanban("kanban_comment", { id, text: text.value });
         await openDrawer(id);
       } catch (e) {
         commentError.textContent = `Couldn't add the comment: ${asError(e).message}`;
@@ -1284,7 +1324,7 @@ function kanbanView(): View {
     return b;
   }
 
-  const refresh = h("button", { className: "link", textContent: "↻", title: "Refresh", onclick: load });
+  const refresh = h("button", { className: "link", textContent: "↻", title: "Refresh", onclick: () => loadBoards().then(load) });
   refresh.setAttribute("aria-label", "Refresh");
   const el = h("div", { className: "kanban", hidden: true },
     h("aside", { className: "panel" },
@@ -1294,12 +1334,12 @@ function kanbanView(): View {
       lastDispatch,
       h("div", { className: "row" }, newTitle, h("button", { className: "link", textContent: "More…", onclick: moreForm })),
       visible, error),
-    h("main", {}, h("div", { className: "board-head" }, h("h1", { textContent: "Board" }), h("span", { className: "badge", textContent: "Default" })), columns),
+    h("main", {}, h("div", { className: "board-head" }, h("h1", { textContent: "Board" }), boardPicker), columns),
     drawer);
   return {
     el,
     show() {
-      load();
+      void loadBoards().then(load); // Boards change rarely: listed on show and Refresh, not every 30 s
       timer = window.setInterval(load, 30_000);
     },
     hide() {

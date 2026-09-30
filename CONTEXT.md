@@ -103,8 +103,12 @@ _Avoid_: theme, color scheme
 ### Work
 
 **Board**:
-The Hermes Kanban board of Tasks; the client works with the default Board only.
+A Hermes Kanban board of Tasks; a host can have several, and one of them is the host's current Board.
 _Avoid_: project, kanban (as a noun)
+
+**Chosen Board**:
+The Board the client shows and acts on, picked per connection and remembered; it starts as the host's current Board, and choosing one never changes the host's current Board.
+_Avoid_: active board, selected board, switching boards
 
 **Task**:
 A unit of work on the Board with a title, body, status, priority, and optional Assignee; unrelated to a Run or a Turn.

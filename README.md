@@ -75,18 +75,18 @@ The microphone records until you click it again, or for up to 2 minutes. The Das
 
 ## Kanban, Skills, and Logs
 
-- **Kanban** shows the default Board. Filter by text, Assignee, tenant, or status (click a stats chip). Create a Task from the "New task" box (Enter), or use **More…** for body, Assignee, priority, and tenant. Click a Task for its body and Comments. **Preview dispatcher** shows what one Dispatch would do; **Run dispatcher** runs one now (at most 8 spawns). Tasks are read-only apart from Comments.
+- **Kanban** shows one Board at a time: pick it next to the Board heading. The app remembers the last Board per connection and otherwise starts on the host's current Board; picking one here never changes the host's current Board for Hermes or its CLI. Filter by text, Assignee, tenant, or status (click a stats chip). Create a Task from the "New task" box (Enter), or use **More…** for body, Assignee, priority, and tenant. Click a Task for its body and Comments. **Preview dispatcher** shows what one Dispatch would do; **Run dispatcher** runs one now (at most 8 spawns). Tasks are read-only apart from Comments.
 - **Skills** lists the active Profile's Skills by category. Click one to read its SKILL.md; the switch enables or disables it on every platform. Essential Skills (`hermes-agent`) can't be switched off. Over SSH, only the Profile's own `skills/` directory is listed, not `skills.external_dirs`.
 - **Logs** is the Client log (see below).
 
-The dev mock (`node mock/server.mjs`) serves a small Board and Skills list too; `MOCK_KANBAN=off` answers like a Hermes with the Kanban plugin disabled.
+The dev mock (`node mock/server.mjs`) serves two small Boards (Default and Ops) and a Skills list too; `MOCK_KANBAN=off` answers like a Hermes with the Kanban plugin disabled.
 
 ## Where things are stored
 
 - `~/.config/local.hermes-desktop/settings.json` holds the two gateway URLs, or the SSH host. It never holds secrets.
 - The API key and sign-in cookie are stored as one entry in the OS keyring: Secret Service on Linux, Keychain on macOS, Credential Manager on Windows. That entry is bound to the gateway URLs it was issued for.
 - Named Profiles' API keys are stored in that same keyring entry.
-- The webview's own storage holds Appearance settings (Theme, Skin, Font size), the last Profile used on each connection, and each Session's model and Reasoning level. It never holds credentials.
+- The webview's own storage holds Appearance settings (Theme, Skin, Font size), the last Profile and Board used on each connection, and each Session's model and Reasoning level. It never holds credentials.
 - **Keyring fallback:** if the keyring is missing, locked, or doesn't answer within 10 s (headless machines, CI), the app says so in a banner. Credentials then stay in memory for that run only, and it asks for them again on the next launch. It never falls back to a plaintext file.
 - The Client log (the **Logs** view, also written to stderr) holds request method, path, and status; SSH subcommand names and exit codes; ACP method names; and keyring or settings warnings. Never message content, task text, or secrets. It keeps the last 2,000 lines in memory and starts empty each launch.
 

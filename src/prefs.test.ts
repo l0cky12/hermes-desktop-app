@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  changeLabel, choiceKey, DEFAULT_CHOICE, loadAppearance, loadChoice, saveAppearance, saveChoice, saveProfile, startProfile,
+  changeLabel, choiceKey, DEFAULT_CHOICE, loadAppearance, loadChoice, saveAppearance, saveBoard, saveChoice, saveProfile, startBoard,
+  startProfile,
 } from "./prefs.ts";
 
 function memory() {
@@ -51,4 +52,17 @@ test("the start Profile is the last used, then the Gateway's default, then defau
   assert.equal(startProfile(store, "other", names, "orchestrator"), "orchestrator");
   saveProfile(store, "c", "gone");
   assert.equal(startProfile(store, "c", names, "orchestrator"), "orchestrator");
+});
+
+test("the start Board is the last chosen on this connection, then the host's current Board", () => {
+  const store = memory();
+  const slugs = ["default", "ops", "ccna"];
+  assert.equal(startBoard(store, "c", slugs, "ops"), "ops");
+  assert.equal(startBoard(store, "c", slugs, null), "default");
+  saveBoard(store, "c", "ccna");
+  assert.equal(startBoard(store, "c", slugs, "ops"), "ccna");
+  assert.equal(startBoard(store, "other", slugs, "ops"), "ops");
+  assert.equal(startBoard(store, "c", ["default", "ops"], "ops"), "ops", "a removed Board falls back to the current one");
+  saveProfile(store, "c", "ops");
+  assert.equal(startBoard(store, "c", slugs, null), "ccna", "Boards and Profiles are remembered apart");
 });
