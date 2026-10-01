@@ -9,6 +9,7 @@
 // keepalive fires mid-stream), "slow" (long, slow reply for kill tests), "approval", "fail".
 // MOCK_TRANSCRIBE_MS delays speech-to-text (try 20000 to outlast the 15 s idle timeout).
 // MOCK_SKILLS_MS delays the Skills list (try 2000, about what a listing over SSH takes).
+// Dashboard /api/analytics/account-usage serves Remaining limits; MOCK_ACCOUNT_USAGE=off answers 404, like a Hermes without the route.
 // Profiles: default (MOCK_KEY), orchestrator (hd-orch-key-7d3e9a1c5b), coder (no key).
 import http from "node:http";
 import { randomBytes } from "node:crypto";
@@ -63,6 +64,21 @@ if (!Object.keys(state.sessions).length) {
     ];
   }
   save();
+}
+
+// The `hermes usage --json` document the account-usage route passes through, or null (exit 1) when the
+// Profile has no account with that provider: "coder" has none; Claude here is an API-key account.
+function accountUsage(url) {
+  if (url.searchParams.get("profile") === "coder") return null;
+  const at = (hours) => new Date(Date.now() + hours * 3600_000).toISOString();
+  const doc = { source: "mock", title: "Account limits", fetched_at: new Date().toISOString(), details: [], unavailable_reason: null };
+  if (url.searchParams.get("provider") === "anthropic") {
+    return { ...doc, provider: "anthropic", plan: null, windows: [], unavailable_reason: "Signed in with an API key: no subscription windows" };
+  }
+  return { ...doc, provider: "openai-codex", plan: "Pro", windows: [
+    { label: "5-hour", used_percent: 97, resets_at: at(1.25), detail: null },
+    { label: "Weekly", used_percent: 83, resets_at: at(76.5), detail: null },
+  ] };
 }
 
 // Like web_routers/analytics.py: the Profile's Sessions started in the last `days` days, summed per
@@ -187,6 +203,7 @@ serve(DASH_PORT, "dashboard", async (req, res, url) => {
   }
   if (route === "GET /api/profiles/active") return send(res, 200, { active: "orchestrator", current: "default" });
   if (route === "GET /api/analytics/usage") return send(res, 200, usageAnalytics(url));
+  if (route === "GET /api/analytics/account-usage" && env.MOCK_ACCOUNT_USAGE !== "off") return send(res, 200, accountUsage(url));
   if (route === "POST /api/audio/transcribe") {
     const body = await readJson(req);
     if (!body?.data_url?.startsWith("data:audio/") && !body?.data_url?.startsWith("data:video/webm")) {

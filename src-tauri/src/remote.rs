@@ -86,12 +86,17 @@ pub fn json(stdout: &str) -> Result<Value, Error> {
         .ok_or_else(|| Error::Http("hermes printed no readable JSON".into()))
 }
 
-/// `hermes -p <profile> usage --json`: the Remaining limit of the Profile's provider account.
-/// `-p` goes before the subcommand, which `hermes()` can't do. `profile` has passed
-/// `picker::valid_profile`; `None` is the Gateway's default Profile.
-pub fn usage(profile: Option<&str>) -> Cmd {
+/// `hermes -p <profile> usage --provider=<p> --json`: the Remaining limit of the Profile's account with
+/// that provider (ADR 0003). Exit 1 prints `null` instead: Hermes has none for that provider. `-p` goes
+/// before the subcommand, and the exit-1 rewrite needs the shell afterwards, so not `hermes()`.
+/// `profile` has passed `picker::valid_profile`; `None` is the Gateway's default Profile.
+// ponytail: exit 1 means both "no credential" and "fetch failed", so a failed fetch hides that
+// provider too. Tell them apart once Hermes gives a distinct exit code.
+pub fn usage(profile: Option<&str>, provider: &str) -> Cmd {
     let profile = profile.map(|p| format!("-p {} ", quote(p))).unwrap_or_default();
-    Cmd { summary: "hermes usage", script: format!("exec hermes {profile}usage --json"), stdin: None }
+    let provider = quote(&format!("--provider={provider}"));
+    let script = format!("hermes {profile}usage {provider} --json; s=$?; [ $s = 1 ] && exec echo null; exit $s");
+    Cmd { summary: "hermes usage", script, stdin: None }
 }
 
 /// POSIX single-quoting: the shell passes the result through as exactly one literal argument.
@@ -291,9 +296,18 @@ mod tests {
     }
 
     #[test]
-    fn usage_runs_for_the_chosen_profile() {
-        assert_eq!(argv_seen_by_hermes(&usage(Some("coder"))), ["-p", "coder", "usage", "--json"]);
-        assert_eq!(argv_seen_by_hermes(&usage(None)), ["usage", "--json"]);
+    fn usage_runs_for_the_chosen_profile_and_provider() {
+        assert_eq!(argv_seen_by_hermes(&usage(Some("coder"), "anthropic")), ["-p", "coder", "usage", "--provider=anthropic", "--json"]);
+        assert_eq!(argv_seen_by_hermes(&usage(None, "openai-codex")), ["usage", "--provider=openai-codex", "--json"]);
+    }
+
+    #[test]
+    fn usage_prints_null_when_hermes_has_no_limit_for_the_provider() {
+        let cmd = usage(None, "anthropic");
+        let out = run_with_fake_hermes(&cmd, "echo no credential >&2; exit 1");
+        assert_eq!((String::from_utf8_lossy(&out.stdout).as_ref(), out.status.code()), ("null\n", Some(0)));
+        let out = run_with_fake_hermes(&cmd, "exit 2");
+        assert_eq!((String::from_utf8_lossy(&out.stdout).as_ref(), out.status.code()), ("", Some(2)));
     }
 
     /// Read-only, but asks the provider. Needs a working local `hermes`:
@@ -301,8 +315,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn reads_the_remaining_limit_from_real_hermes() {
-        let limit = crate::usage::limit(json(&run("localhost", usage(None)).await.unwrap()).unwrap()).unwrap();
-        assert!(!limit.provider.is_empty());
+        let doc = json(&run("localhost", usage(None, "openai-codex")).await.unwrap()).unwrap();
+        if !doc.is_null() {
+            // null: this Hermes has no Codex credential
+            assert!(!crate::usage::limit(doc).unwrap().provider.is_empty());
+        }
     }
 
     #[test]

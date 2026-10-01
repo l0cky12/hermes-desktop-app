@@ -539,17 +539,36 @@ async fn usage_past_hour(state: State<'_, AppState>) -> Result<usage::Tally, Err
     usage::tally_since(sessions, now - 3600.0).map_err(|e| Error::Http(format!("Unreadable sessions: {e}")))
 }
 
-/// The Remaining limit of the current Profile's provider account. Only `hermes usage` reports it, so
-/// this runs it over a one-shot `ssh`, as ADR 0002 does for the Board and Skills.
+/// The Remaining limit of the current Profile's account with `provider`, or `None` when Hermes has none
+/// (ADR 0003). Only `hermes usage` reports it: over SSH this runs it one-shot, as ADR 0002 does for the
+/// Board and Skills; over HTTP the Dashboard's account-usage route runs it on the host.
 #[tauri::command]
-async fn usage_limit(state: State<'_, AppState>) -> Result<usage::Limit, Error> {
+async fn usage_limit(state: State<'_, AppState>, provider: String) -> Result<Option<usage::Limit>, Error> {
     let (host, profile) = {
         let inner = state.lock();
         (inner.ssh_host.clone(), inner.profile.clone())
     };
-    let host = host.ok_or_else(|| Error::Invalid("Remaining limit isn't available over HTTP".into()))?;
-    let body = remote::json(&remote::run(&host, remote::usage(profile.as_deref())).await?)?;
-    usage::limit(body).map_err(|e| Error::Http(format!("Unreadable hermes usage output: {e}")))
+    let body = match host {
+        Some(host) => remote::json(&remote::run(&host, remote::usage(profile.as_deref(), &provider)).await?)?,
+        None => {
+            let mut query = vec![("provider", provider.as_str())];
+            query.extend(profile.as_deref().map(|p| ("profile", p)));
+            limit_404(state.dashboard_json(state.dashboard(Method::GET, &["api", "analytics", "account-usage"], &query)?).await)?
+        }
+    };
+    if body.is_null() {
+        return Ok(None);
+    }
+    usage::limit(body).map(Some).map_err(|e| Error::Http(format!("Unreadable hermes usage output: {e}")))
+}
+
+/// `NotFound` means the route is missing (the UI's "needs a newer Hermes"), so only the framework's own
+/// bare "Not Found" keeps it. The route also answers 404 for a Profile the host doesn't have.
+fn limit_404(result: Result<Value, Error>) -> Result<Value, Error> {
+    match result {
+        Err(Error::NotFound(m)) if m != "Not Found" => Err(Error::Http(format!("HTTP 404: {m}"))),
+        other => other,
+    }
 }
 
 /// Answers an Approval request from Hermes over SSH; `None` denies by cancelling.
@@ -1273,6 +1292,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_missing_route_reads_as_a_hermes_without_the_remaining_limit() {
+        assert!(matches!(limit_404(Err(Error::NotFound("Not Found".into()))), Err(Error::NotFound(_))));
+        // The route's own 404, for a Profile the Gateway host doesn't have, is an ordinary failure.
+        match limit_404(Err(Error::NotFound("Profile 'ghost' does not exist.".into()))) {
+            Err(Error::Http(m)) => assert_eq!(m, "HTTP 404: Profile 'ghost' does not exist."),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(limit_404(Ok(Value::Null)).unwrap(), Value::Null);
+    }
 
     #[test]
     fn a_clipboard_image_is_only_ever_a_png() {

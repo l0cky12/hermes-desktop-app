@@ -1964,8 +1964,10 @@ type Limit = { provider: string; title: string | null; plan: string | null; fetc
 /** Range label and analytics days; 0 is the past hour, which the analytics route can't count. */
 const RANGES: [string, number][] = [["Past hour", 0], ["24 hours", 1], ["7 days", 7], ["30 days", 30]];
 const NO_USAGE: Tally = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, estimated_cost: 0, sessions: 0 };
+/** The subscription providers `hermes usage` can report a Remaining limit for; each gets a card when it has one. */
+const LIMIT_PROVIDERS = ["openai-codex", "anthropic"];
 
-/** The active Profile's spend and tokens over a range (HTTP), and its provider's Remaining limit (SSH). */
+/** The active Profile's spend and tokens over a range (HTTP), and its Codex and Claude Remaining limits. */
 function usageView(): View {
   let days = 1;
   let limitAsked = 0; // the newest loadLimit; an older, slower answer is dropped
@@ -2027,33 +2029,35 @@ function usageView(): View {
   async function loadLimit() {
     const head = h("h2", { textContent: "Remaining limit" });
     const muted = (text: string) => h("p", { className: "muted", textContent: text });
-    if (!overSsh) {
-      return limit.replaceChildren(head,
-        muted("Hermes reports this only to hermes usage on its host, not to the Dashboard or API server. Connect over SSH to see it here."));
-    }
-    limit.replaceChildren(head, muted("Asking the provider…"));
+    limit.replaceChildren(head, muted("Asking the providers…"));
     const asked = ++limitAsked;
-    let account: Limit;
-    try {
-      account = await invoke<Limit>("usage_limit");
-    } catch (e) {
-      if (asked !== limitAsked) return;
-      return limit.replaceChildren(head, h("p", { className: "error", textContent: `Couldn't read the limit: ${asError(e).message}` }));
-    }
+    const results = await Promise.allSettled(LIMIT_PROVIDERS.map((provider) => call<Limit | null>("usage_limit", { provider })));
     if (asked !== limitAsked) return;
+    const failed = results.flatMap((r) => (r.status === "rejected" ? [asError(r.reason)] : []));
+    if (failed.some((e) => e.kind === "not_found")) return limit.replaceChildren(head, muted("The Remaining limit needs a newer Hermes on the Gateway."));
+    const accounts = results.flatMap((r) => (r.status === "fulfilled" && r.value ? [r.value] : []));
     limit.replaceChildren(head,
-      muted([account.title ?? "Account limits", account.provider, account.plan].filter(Boolean).join(" · ")),
-      ...account.windows.map((w) => {
+      ...accounts.map(account),
+      ...(!accounts.length && !failed.length ? [muted("This Profile has no Codex or Claude subscription limits.")] : []),
+      ...(failed.length ? [h("p", { className: "error", textContent: `Couldn't read the limit: ${failed[0].message}` })] : []));
+  }
+
+  /** One provider account's card. The meter shows what's left, amber from 80% used and red from 95%. */
+  function account(a: Limit): HTMLElement {
+    const muted = (text: string) => h("p", { className: "muted", textContent: text });
+    return h("div", { className: "account" },
+      muted([a.title ?? "Account limits", a.provider, a.plan].filter(Boolean).join(" · ")),
+      ...a.windows.map((w) => {
         const left = w.used_percent === null ? null : percentLeft(w.used_percent);
-        const meter = h("meter", { min: 0, max: 100, value: left ?? 0 });
+        const meter = h("meter", { min: 0, max: 100, low: 5.5, high: 20.5, optimum: 100, value: left ?? 0 });
         meter.setAttribute("aria-label", `${w.label} left`);
         const parts = [left === null ? "" : `${left}% left`, w.detail ?? "", w.resets_at ? `resets ${new Date(w.resets_at).toLocaleString()}` : ""];
         return h("div", { className: "window" }, h("strong", { textContent: w.label }), ...(left === null ? [] : [meter]),
           muted(parts.filter(Boolean).join(" · ")));
       }),
-      ...account.details.map((d) => h("p", { textContent: d })),
-      ...(account.unavailable_reason ? [h("p", { className: "error", textContent: account.unavailable_reason })] : []),
-      ...(account.fetched_at ? [muted(`Checked ${new Date(account.fetched_at).toLocaleString()}`)] : []));
+      ...a.details.map((d) => h("p", { textContent: d })),
+      ...(a.unavailable_reason ? [h("p", { className: "error", textContent: a.unavailable_reason })] : []),
+      ...(a.fetched_at ? [muted(`Checked ${new Date(a.fetched_at).toLocaleString()}`)] : []));
   }
 
   function load() {
@@ -2064,7 +2068,7 @@ function usageView(): View {
   const refresh = h("button", { className: "link", textContent: "↻", title: "Refresh", onclick: load });
   refresh.setAttribute("aria-label", "Refresh");
   const history = h("section", {}, chips, note, error, stats, daily, dailyNote);
-  const sshNote = h("p", { className: "muted", textContent: "Over SSH, Hermes prints spend and token history only as text (hermes insights), so only the Remaining limit is shown." });
+  const sshNote = h("p", { className: "muted", textContent: "Over SSH, Hermes prints spend and token history only as text (hermes insights), so only the Remaining limits are shown." });
   const el = h("div", { className: "usage", hidden: true }, h("div", { className: "row" }, h("h2", { textContent: "Usage" }), refresh), history, sshNote, limit);
   return {
     el,

@@ -113,7 +113,7 @@ The dev mock (`node mock/server.mjs`) serves two small Boards (Default and Ops) 
 The **Usage** view (chart icon) covers the active Profile only.
 
 - **Spend and tokens:** spend in dollars (Hermes's estimate from its price list), tokens in and out, and the Session count for the past hour, 24 hours, 7 days, or 30 days, with a per-day table for 7 and 30 days. Sessions count by when they started, with everything they've used so far. Over HTTP this reads the Dashboard's `GET /api/analytics/usage`, and the totals include side calls (compression, titles, vision), which Hermes counts per task rather than per day. The past hour isn't a whole day, so that range sums the API server's Session records instead: the newest 200, without side calls. Over SSH none of this is shown, because Hermes prints that history only as text (`hermes insights`).
-- **Remaining limit:** how much of the provider account's rate-limit or credit windows is left, for the Profile's configured provider, from `hermes -p <profile> usage --json` on the host. It's shown over SSH only, because the Dashboard and API server don't report it.
+- **Remaining limit:** how much is left of each rate-limit window on the Profile's Codex and Claude subscription accounts, one card per account it has, from `hermes -p <profile> usage --provider=<p> --json` on the host ([ADR 0003](docs/adr/0003-remaining-limit-via-hermes-usage.md)). A meter turns amber from 80% used and red from 95%. Over SSH the app runs that command itself; over HTTP it reads the Dashboard's `GET /api/analytics/account-usage`, and a Hermes too old to have that route shows "needs a newer Hermes" instead.
 
 The mock's `GET /api/analytics/usage` sums its Sessions, and a fresh mock state seeds a few Sessions with usage. `(cd src-tauri && HERMES_DESKTOP_SSH=$PWD/../mock/fake-ssh cargo test -- --ignored)` also reads the real `hermes usage` (it asks the provider).
 
@@ -153,7 +153,7 @@ node mock/server.mjs   # Dashboard :19119, API server :18642
                        # user tester / correct-horse-battery, key hd-test-key-4f9c2a7e1b
 ```
 
-Profiles: `default` (the key above), `orchestrator` (`hd-orch-key-7d3e9a1c5b`), and `coder` (no key, so switching to it is refused). Replies start with `[profile · model · reasoning]` so you can see what a Run was sent with. `MOCK_NO_MODELS=1` makes the model list fail; `MOCK_TRANSCRIBE_MS` delays speech-to-text.
+Profiles: `default` (the key above), `orchestrator` (`hd-orch-key-7d3e9a1c5b`), and `coder` (no key, so switching to it is refused). Replies start with `[profile · model · reasoning]` so you can see what a Run was sent with. `MOCK_NO_MODELS=1` makes the model list fail; `MOCK_TRANSCRIBE_MS` delays speech-to-text; `MOCK_ACCOUNT_USAGE=off` answers the Remaining limit route with 404, like an older Hermes.
 
 Prompt keywords script the reply:
 - `tool`: tool events
