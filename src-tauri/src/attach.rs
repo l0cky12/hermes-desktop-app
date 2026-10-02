@@ -92,10 +92,15 @@ pub fn dropped_image(path: &Path) -> Result<Option<String>, String> {
 /// Metadata is only an early rejection: files can grow or report zero (e.g. procfs).
 fn read_file(path: &Path, limit: u64, too_big: &str) -> Result<Vec<u8>, String> {
     let io_error = |e| format!("{}: {e}", path.display());
-    if !std::fs::metadata(path).map_err(io_error)?.is_file() {
-        return Err(format!("{}: only regular files can be attached", path.display()));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Check the opened handle, without blocking if the path was replaced by a FIFO.
+        options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = std::fs::File::open(path).map_err(io_error)?;
+    let file = options.open(path).map_err(io_error)?;
     let metadata = file.metadata().map_err(io_error)?;
     if !metadata.is_file() {
         return Err(format!("{}: only regular files can be attached", path.display()));
@@ -180,6 +185,18 @@ mod tests {
         // procfs is a regular file with metadata length zero but a nonempty body.
         assert_eq!(std::fs::metadata("/proc/self/cmdline").unwrap().len(), 0);
         assert_eq!(read_file(Path::new("/proc/self/cmdline"), 1, "over budget").unwrap_err(), "over budget");
+        let fifo = std::env::temp_dir().join(format!("hd-attach-fifo-{}", std::process::id()));
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || tx.send(read_file(&path, 1, "over budget")));
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        if result.is_err() {
+            // Unblock a regressed reader before reporting failure.
+            let _ = std::fs::OpenOptions::new().read(true).write(true).open(&fifo);
+        }
+        std::fs::remove_file(fifo).unwrap();
+        assert!(result.expect("opening a FIFO must not block").unwrap_err().contains("regular files"));
     }
 
     #[test]
