@@ -26,3 +26,7 @@ tauri-plugin-dialog = "2"
 webkit2gtk = { version = "2", features = ["v2_40"] }
 # Pasted screenshots: WebKitGTK hides raw clipboard images from the page, so Rust reads them; same crate Tauri already uses.
 gtk = "0.18"
+
+[target.'cfg(unix)'.dependencies]
+# Already in the dependency graph; use the platform's O_NONBLOCK for safe attachment opens.
+libc = "0.2"

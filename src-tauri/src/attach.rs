@@ -4,6 +4,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// What all of a Turn's Attachments may weigh together. The API server refuses request bodies over
@@ -29,11 +30,7 @@ fn read(file: &Source, left: u64) -> Result<(String, Vec<u8>), String> {
     match file {
         Source::Dropped { path } => {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let size = std::fs::metadata(path).map_err(|e| format!("{name}: {e}"))?.len();
-            if size > left {
-                return Err(too_big(&name));
-            }
-            Ok((name.clone(), std::fs::read(path).map_err(|e| format!("{name}: {e}"))?))
+            Ok((name.clone(), read_file(path, left, &too_big(&name))?))
         }
         Source::Inline { name, data_url } => {
             let data = match data_url.split_once(',') {
@@ -41,6 +38,9 @@ fn read(file: &Source, left: u64) -> Result<(String, Vec<u8>), String> {
                 _ if data_url == "data:" => "",
                 _ => return Err(format!("{name}: not a base64 data URL")),
             };
+            if data.len() as u64 > left.div_ceil(3) * 4 {
+                return Err(too_big(name));
+            }
             let bytes = STANDARD.decode(data).map_err(|e| format!("{name}: {e}"))?;
             if bytes.len() as u64 > left {
                 return Err(too_big(name));
@@ -85,12 +85,35 @@ pub fn build_input(text: &str, files: &[Source]) -> Result<Value, String> {
 /// isn't an image.
 pub fn dropped_image(path: &Path) -> Result<Option<String>, String> {
     let Some(mime) = image_mime(path) else { return Ok(None) };
-    let size = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?.len();
-    if size > MAX_SHRINKABLE_BYTES {
-        return Err(format!("{}: too large to shrink (over 50 MB)", path.display()));
-    }
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = read_file(path, MAX_SHRINKABLE_BYTES, &format!("{}: too large to shrink (over 50 MB)", path.display()))?;
     Ok(Some(format!("data:{mime};base64,{}", STANDARD.encode(bytes))))
+}
+
+/// Metadata is only an early rejection: files can grow or report zero (e.g. procfs).
+fn read_file(path: &Path, limit: u64, too_big: &str) -> Result<Vec<u8>, String> {
+    let io_error = |e| format!("{}: {e}", path.display());
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Check the opened handle, without blocking if the path was replaced by a FIFO.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(io_error)?;
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(format!("{}: only regular files can be attached", path.display()));
+    }
+    if metadata.len() > limit {
+        return Err(too_big.to_owned());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes).map_err(io_error)?;
+    if bytes.len() as u64 > limit {
+        return Err(too_big.to_owned());
+    }
+    Ok(bytes)
 }
 
 fn image_mime(path: &Path) -> Option<&'static str> {
@@ -153,6 +176,27 @@ mod tests {
         assert_eq!(dropped_image(&path).unwrap().as_deref(), Some("data:image/png;base64,iVBORw=="));
         let Source::Dropped { path } = temp("notes2.md", b"x") else { unreachable!() };
         assert_eq!(dropped_image(&path).unwrap(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropped_reads_reject_devices_and_enforce_actual_bytes() {
+        assert!(build_input("", &[Source::Dropped { path: "/dev/null".into() }]).unwrap_err().contains("regular files"));
+        // procfs is a regular file with metadata length zero but a nonempty body.
+        assert_eq!(std::fs::metadata("/proc/self/cmdline").unwrap().len(), 0);
+        assert_eq!(read_file(Path::new("/proc/self/cmdline"), 1, "over budget").unwrap_err(), "over budget");
+        let fifo = std::env::temp_dir().join(format!("hd-attach-fifo-{}", std::process::id()));
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || tx.send(read_file(&path, 1, "over budget")));
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        if result.is_err() {
+            // Unblock a regressed reader before reporting failure.
+            let _ = std::fs::OpenOptions::new().read(true).write(true).open(&fifo);
+        }
+        std::fs::remove_file(fifo).unwrap();
+        assert!(result.expect("opening a FIFO must not block").unwrap_err().contains("regular files"));
     }
 
     #[test]

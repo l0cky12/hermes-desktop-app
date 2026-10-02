@@ -1615,6 +1615,7 @@ dependencies = [
  "base64 0.22.1",
  "gtk",
  "keyring",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
