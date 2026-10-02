@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -80,12 +80,16 @@ fn ssh(host: &str, command: &str) -> Command {
 
 /// Starts `ssh host hermes acp` and completes the ACP handshake.
 pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Error> {
-    let mut child = ssh(host, &remote(profile))
+    let child = ssh(host, &remote(profile))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| Error::Unreachable(format!("Could not run ssh: {e}")))?;
+    connect_child(host, child).await
+}
+
+async fn connect_child(host: &str, mut child: Child) -> Result<Arc<Conn>, Error> {
     let stderr = tokio::spawn(tail(BufReader::new(child.stderr.take().expect("piped")).lines()));
     let mut lines = BufReader::new(child.stdout.take().expect("piped")).lines();
     let home = loop {
@@ -113,10 +117,11 @@ pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Err
         usage: Mutex::default(),
         _child: child,
     });
-    tokio::spawn(read(conn.clone(), lines, stderr));
+    tokio::spawn(read(Arc::downgrade(&conn), lines, stderr));
     let client = json!({ "name": "hermes-desktop", "version": env!("CARGO_PKG_VERSION") });
     let init = json!({ "protocolVersion": 1, "clientCapabilities": {}, "clientInfo": client });
-    conn.request("initialize", init).await?;
+    tokio::time::timeout(Duration::from_secs(30), conn.request("initialize", init)).await
+        .map_err(|_| Error::Unreachable(format!("Hermes on {host} did not initialize within 30 s")))??;
     crate::log::write("acp", format!("connected to {host}"));
     Ok(conn)
 }
@@ -154,13 +159,15 @@ fn exited(stderr: String) -> String {
     }
 }
 
-async fn read(conn: Arc<Conn>, mut lines: Lines<BufReader<ChildStdout>>, stderr: JoinHandle<String>) {
+async fn read(conn: Weak<Conn>, mut lines: Lines<BufReader<ChildStdout>>, stderr: JoinHandle<String>) {
     while let Ok(Some(line)) = lines.next_line().await {
         if let Ok(msg) = serde_json::from_str::<Value>(&line) {
+            let Some(conn) = conn.upgrade() else { return };
             conn.dispatch(msg).await;
         }
     }
     let why = exited(stderr.await.unwrap_or_default());
+    let Some(conn) = conn.upgrade() else { return };
     // Only the fact: the stderr tail in `why` could echo anything Hermes printed.
     crate::log::write("acp", "connection closed");
     *conn.closed.lock().unwrap() = why.clone();
@@ -447,6 +454,22 @@ pub fn history(updates: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_reader_does_not_keep_a_replaced_connection_alive() {
+        let child = Command::new("sh").args(["-c", r#"
+            printf 'hermes-desktop-home /tmp\n'
+            read -r request
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+            while read -r request; do :; done
+        "#]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .kill_on_drop(true).spawn().unwrap();
+        let conn = tokio::time::timeout(Duration::from_secs(5), connect_child("test", child)).await.unwrap().unwrap();
+        let weak = Arc::downgrade(&conn);
+        drop(conn);
+        assert!(weak.upgrade().is_none(), "the reader must not own the SSH child after a Profile switch");
+    }
 
     /// Needs a working local `hermes`: `HERMES_DESKTOP_SSH=$PWD/../mock/fake-ssh cargo test -- --ignored`
     #[tokio::test]

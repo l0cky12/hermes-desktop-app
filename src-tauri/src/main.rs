@@ -340,6 +340,7 @@ async fn configure(state: State<'_, AppState>, dashboard_url: String, api_url: S
         }
         changed
     };
+    state.hermes.lock().await.take();
     if changed {
         state.persist().await;
     }
