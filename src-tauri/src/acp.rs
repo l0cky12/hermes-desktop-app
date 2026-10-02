@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -46,7 +46,7 @@ pub fn valid_host(input: &str) -> Result<String, Error> {
 }
 
 pub struct Conn {
-    stdin: tokio::sync::Mutex<ChildStdin>,
+    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
     next_id: AtomicI64,
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<Value, Error>>>>,
     /// Where `session/update` notifications (and permission requests) for a Session go.
@@ -80,12 +80,16 @@ fn ssh(host: &str, command: &str) -> Command {
 
 /// Starts `ssh host hermes acp` and completes the ACP handshake.
 pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Error> {
-    let mut child = ssh(host, &remote(profile))
+    let child = ssh(host, &remote(profile))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| Error::Unreachable(format!("Could not run ssh: {e}")))?;
+    connect_child(host, child).await
+}
+
+async fn connect_child(host: &str, mut child: Child) -> Result<Arc<Conn>, Error> {
     let stderr = tokio::spawn(tail(BufReader::new(child.stderr.take().expect("piped")).lines()));
     let mut lines = BufReader::new(child.stdout.take().expect("piped")).lines();
     let home = loop {
@@ -99,7 +103,7 @@ pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Err
         }
     };
     let conn = Arc::new(Conn {
-        stdin: tokio::sync::Mutex::new(child.stdin.take().expect("piped")),
+        stdin: Arc::new(tokio::sync::Mutex::new(child.stdin.take().expect("piped"))),
         next_id: AtomicI64::new(1),
         pending: Mutex::default(),
         listeners: Mutex::default(),
@@ -113,10 +117,11 @@ pub async fn connect(host: &str, profile: Option<&str>) -> Result<Arc<Conn>, Err
         usage: Mutex::default(),
         _child: child,
     });
-    tokio::spawn(read(conn.clone(), lines, stderr));
+    tokio::spawn(read(Arc::downgrade(&conn), lines, stderr));
     let client = json!({ "name": "hermes-desktop", "version": env!("CARGO_PKG_VERSION") });
     let init = json!({ "protocolVersion": 1, "clientCapabilities": {}, "clientInfo": client });
-    conn.request("initialize", init).await?;
+    tokio::time::timeout(Duration::from_secs(30), conn.request("initialize", init)).await
+        .map_err(|_| Error::Unreachable(format!("Hermes on {host} did not initialize within 30 s")))??;
     crate::log::write("acp", format!("connected to {host}"));
     Ok(conn)
 }
@@ -154,13 +159,20 @@ fn exited(stderr: String) -> String {
     }
 }
 
-async fn read(conn: Arc<Conn>, mut lines: Lines<BufReader<ChildStdout>>, stderr: JoinHandle<String>) {
+async fn read(conn: Weak<Conn>, mut lines: Lines<BufReader<ChildStdout>>, stderr: JoinHandle<String>) {
     while let Ok(Some(line)) = lines.next_line().await {
         if let Ok(msg) = serde_json::from_str::<Value>(&line) {
-            conn.dispatch(msg).await;
+            let Some(conn) = conn.upgrade() else { return };
+            let response = conn.dispatch(msg);
+            let stdin = conn.stdin.clone();
+            drop(conn); // A blocked automatic reply must not keep the SSH child alive.
+            if let Some(response) = response {
+                let _ = write_message(&stdin, response).await;
+            }
         }
     }
     let why = exited(stderr.await.unwrap_or_default());
+    let Some(conn) = conn.upgrade() else { return };
     // Only the fact: the stderr tail in `why` could echo anything Hermes printed.
     crate::log::write("acp", "connection closed");
     *conn.closed.lock().unwrap() = why.clone();
@@ -169,6 +181,14 @@ async fn read(conn: Arc<Conn>, mut lines: Lines<BufReader<ChildStdout>>, stderr:
         let _ = tx.send(Err(Error::Unreachable(why.clone())));
     }
     conn.listeners.lock().unwrap().clear();
+}
+
+async fn write_message(stdin: &tokio::sync::Mutex<ChildStdin>, msg: Value) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(&msg).expect("serializable");
+    line.push(b'\n');
+    let mut stdin = stdin.lock().await;
+    stdin.write_all(&line).await?;
+    stdin.flush().await
 }
 
 impl Conn {
@@ -180,7 +200,7 @@ impl Conn {
         self.closed.lock().unwrap().clone()
     }
 
-    async fn dispatch(&self, msg: Value) {
+    fn dispatch(&self, msg: Value) -> Option<Value> {
         let session = msg["params"]["sessionId"].as_str().unwrap_or_default().to_owned();
         match (msg["method"].as_str(), msg.get("id").cloned()) {
             (Some("session/update"), None) => {
@@ -194,17 +214,17 @@ impl Conn {
                 if delivered {
                     self.permissions.lock().unwrap().entry(session).or_default().push(id);
                 } else {
-                    self.respond(id, json!({ "outcome": { "outcome": "cancelled" } })).await;
+                    return Some(json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": { "outcome": "cancelled" } } }));
                 }
             }
             (Some(_), Some(id)) => {
                 // We advertise no client capabilities (fs, terminal), so nothing else should arrive.
                 let error = json!({ "code": -32601, "message": "Method not found" });
-                let _ = self.write(json!({ "jsonrpc": "2.0", "id": id, "error": error })).await;
+                return Some(json!({ "jsonrpc": "2.0", "id": id, "error": error }));
             }
             (Some(_), None) => {}
             (None, Some(id)) => {
-                let Some(tx) = id.as_i64().and_then(|id| self.pending.lock().unwrap().remove(&id)) else { return };
+                let Some(tx) = id.as_i64().and_then(|id| self.pending.lock().unwrap().remove(&id)) else { return None };
                 let result = match msg.get("error") {
                     Some(e) => Err(Error::Http(e["message"].as_str().unwrap_or("Hermes returned an error").to_owned())),
                     None => Ok(msg["result"].clone()),
@@ -213,14 +233,11 @@ impl Conn {
             }
             (None, None) => {}
         }
+        None
     }
 
     async fn write(&self, msg: Value) -> Result<(), Error> {
-        let mut line = serde_json::to_vec(&msg).expect("serializable");
-        line.push(b'\n');
-        let mut stdin = self.stdin.lock().await;
-        let written = async { stdin.write_all(&line).await.and(stdin.flush().await) }.await;
-        written.map_err(|_| Error::Unreachable(self.closed_reason()))
+        write_message(&self.stdin, msg).await.map_err(|_| Error::Unreachable(self.closed_reason()))
     }
 
     async fn respond(&self, id: Value, result: Value) {
@@ -447,6 +464,29 @@ pub fn history(updates: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_reader_does_not_keep_a_replaced_connection_alive() {
+        let child = Command::new("sh").args(["-c", r#"
+            printf 'hermes-desktop-home /tmp\n'
+            read -r request
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+            read -r request
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"unsupported"}'
+            while read -r request; do :; done
+        "#]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .kill_on_drop(true).spawn().unwrap();
+        let conn = tokio::time::timeout(Duration::from_secs(5), connect_child("test", child)).await.unwrap().unwrap();
+        let weak = Arc::downgrade(&conn);
+        let stdin = conn.stdin.clone();
+        let mut locked = stdin.lock().await;
+        locked.write_all(b"trigger\n").await.unwrap();
+        // Hold the writer while the reader handles the automatic method-not-found reply.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(conn);
+        assert!(weak.upgrade().is_none(), "the reader must not own the SSH child after a Profile switch");
+    }
 
     /// Needs a working local `hermes`: `HERMES_DESKTOP_SSH=$PWD/../mock/fake-ssh cargo test -- --ignored`
     #[tokio::test]
