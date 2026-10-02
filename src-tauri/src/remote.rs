@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 /// A remote command: `summary` is all the Client log ever sees of it.
 pub struct Cmd {
@@ -30,7 +30,7 @@ impl Cmd {
 pub async fn run(host: &str, cmd: Cmd) -> Result<String, Error> {
     // Tests point this at a shim that runs the remote command locally (see mock/fake-ssh).
     let ssh = std::env::var_os("HERMES_DESKTOP_SSH").unwrap_or_else(|| "ssh".into());
-    let mut child = Command::new(ssh)
+    let child = Command::new(ssh)
         .args(["-T", "-o", "BatchMode=yes", "--", host, &cmd.remote_line()])
         .stdin(if cmd.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
@@ -41,11 +41,7 @@ pub async fn run(host: &str, cmd: Cmd) -> Result<String, Error> {
             crate::log::write("ssh", format!("{} -> could not run ssh: {e}", cmd.summary));
             Error::Unreachable(format!("Could not run ssh: {e}"))
         })?;
-    if let (Some(text), Some(mut stdin)) = (cmd.stdin, child.stdin.take()) {
-        // Dropping stdin afterwards is the EOF `--body-file -` waits for.
-        let _ = stdin.write_all(text.as_bytes()).await;
-    }
-    let output = match tokio::time::timeout(Duration::from_secs(60), child.wait_with_output()).await {
+    let output = match tokio::time::timeout(Duration::from_secs(60), output(child, cmd.stdin)).await {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => {
             crate::log::write("ssh", format!("{} -> ssh failed: {e}", cmd.summary));
@@ -69,6 +65,25 @@ pub async fn run(host: &str, cmd: Cmd) -> Result<String, Error> {
         Some(255) => Error::Unreachable(format!("ssh: {why}")),
         _ => Error::Http(format!("{} failed: {why}", cmd.summary)),
     })
+}
+
+/// Drain output while feeding stdin: either pipe may fill before Hermes reads its input.
+/// The caller's timeout covers both futures; dropping them kills the child.
+async fn output(mut child: Child, input: Option<String>) -> std::io::Result<std::process::Output> {
+    let stdin = child.stdin.take();
+    let write = async move {
+        if let (Some(text), Some(mut stdin)) = (input, stdin) {
+            stdin.write_all(text.as_bytes()).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    let (written, result) = tokio::join!(write, child.wait_with_output());
+    let result = result?;
+    // Preserve Hermes's error output if it exited early; a successful partial write is an error.
+    if result.status.success() {
+        written?;
+    }
+    Ok(result)
 }
 
 fn last_lines(text: &str) -> String {
@@ -293,6 +308,23 @@ mod tests {
     fn argv_seen_by_hermes(cmd: &Cmd) -> Vec<String> {
         let text = String::from_utf8(run_with_fake_hermes(cmd, "printf '%s\\0' \"$@\"").stdout).unwrap();
         text.split_terminator('\0').map(str::to_owned).collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_and_output_make_progress_together_and_share_the_timeout() {
+        let child = Command::new("sh").args(["-c", "head -c 262144 /dev/zero; cat >/dev/null"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .kill_on_drop(true).spawn().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), output(child, Some("x".repeat(262144))))
+            .await.expect("full stdout must not block stdin").unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout.len(), 262144);
+
+        let child = Command::new("sleep").arg("30")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .kill_on_drop(true).spawn().unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), output(child, Some("x".repeat(262144)))).await.is_err());
     }
 
     #[test]
