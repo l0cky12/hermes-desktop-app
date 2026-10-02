@@ -100,9 +100,9 @@ struct AppState {
     hermes: tokio::sync::Mutex<Option<Arc<acp::Conn>>>,
     /// SSH-mode Runs by run id: their Session, and the prompt until `stream_run` sends it.
     acp_runs: Mutex<HashMap<String, AcpRun>>,
-    /// Over SSH, per host: each listed Skill's SKILL.md path, so reading one never takes a path
-    /// from the webview, nor a path listed on another host.
-    skill_paths: Mutex<HashMap<String, HashMap<String, String>>>,
+    /// Over SSH, per host and Profile: each listed Skill's SKILL.md path, so reading one never takes a path
+    /// from the webview, nor a path listed on another host or Profile.
+    skill_paths: Mutex<HashMap<(String, Option<String>), HashMap<String, String>>>,
 }
 
 struct AcpRun {
@@ -184,6 +184,12 @@ impl AppState {
     fn ssh_profile(&self) -> Option<(String, Option<String>)> {
         let inner = self.lock();
         Some((inner.ssh_host.clone()?, inner.profile.clone()))
+    }
+
+    fn skill_path(&self, host: &str, profile: Option<String>, name: &str) -> Result<String, Error> {
+        self.skill_paths.lock().unwrap().get(&(host.to_owned(), profile))
+            .and_then(|paths| paths.get(name)).cloned()
+            .ok_or_else(|| Error::NotFound(format!("No skill named {name}")))
     }
 
     /// The SSH connection to Hermes, (re)started on demand.
@@ -1081,7 +1087,7 @@ async fn skills_list(state: State<'_, AppState>) -> Result<Vec<work::Skill>, Err
     if let Some((host, profile)) = state.ssh_profile() {
         let output = remote::run(&host, remote::skills_list(profile.as_deref())).await?;
         let (skills, paths) = work::skills_from_ssh(&output).ok_or_else(|| Error::Http("hermes printed no profile home".into()))?;
-        state.skill_paths.lock().unwrap().insert(host, paths);
+        state.skill_paths.lock().unwrap().insert((host, profile), paths);
         return Ok(skills);
     }
     Ok(work::skills_from_dashboard(state.dashboard_json(state.skills(Method::GET, &[], &[])?).await?))
@@ -1090,9 +1096,8 @@ async fn skills_list(state: State<'_, AppState>) -> Result<Vec<work::Skill>, Err
 /// The Skill's raw SKILL.md.
 #[tauri::command]
 async fn skill_content(state: State<'_, AppState>, name: String) -> Result<String, Error> {
-    if let Some(host) = state.ssh_host() {
-        let path = state.skill_paths.lock().unwrap().get(&host).and_then(|paths| paths.get(&name)).cloned();
-        let path = path.ok_or_else(|| Error::NotFound(format!("No skill named {name}")))?;
+    if let Some((host, profile)) = state.ssh_profile() {
+        let path = state.skill_path(&host, profile, &name)?;
         return remote::run(&host, remote::skill_content(&path)).await;
     }
     let request = state.skills(Method::GET, &["content"], &[("name", &name)])?;
@@ -1340,6 +1345,17 @@ mod tests {
             acp_runs: Mutex::default(),
             skill_paths: Mutex::default(),
         }
+    }
+
+    #[test]
+    fn ssh_skill_paths_are_isolated_even_when_an_old_listing_finishes_last() {
+        let state = state_as(Some("coder"), Some("host"));
+        let paths = |path: &str| HashMap::from([("shared".into(), path.into())]);
+        state.skill_paths.lock().unwrap().insert(("host".into(), Some("coder".into())), paths("/coder/SKILL.md"));
+        state.skill_paths.lock().unwrap().insert(("host".into(), Some("default".into())), paths("/default/SKILL.md"));
+        assert_eq!(state.skill_path("host", Some("coder".into()), "shared").unwrap(), "/coder/SKILL.md");
+        assert!(state.skill_path("host", Some("other".into()), "shared").is_err());
+        assert!(state.skill_path("other-host", Some("coder".into()), "shared").is_err());
     }
 
     #[test]
