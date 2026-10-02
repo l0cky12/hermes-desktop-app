@@ -46,7 +46,7 @@ pub fn valid_host(input: &str) -> Result<String, Error> {
 }
 
 pub struct Conn {
-    stdin: tokio::sync::Mutex<ChildStdin>,
+    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
     next_id: AtomicI64,
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<Value, Error>>>>,
     /// Where `session/update` notifications (and permission requests) for a Session go.
@@ -103,7 +103,7 @@ async fn connect_child(host: &str, mut child: Child) -> Result<Arc<Conn>, Error>
         }
     };
     let conn = Arc::new(Conn {
-        stdin: tokio::sync::Mutex::new(child.stdin.take().expect("piped")),
+        stdin: Arc::new(tokio::sync::Mutex::new(child.stdin.take().expect("piped"))),
         next_id: AtomicI64::new(1),
         pending: Mutex::default(),
         listeners: Mutex::default(),
@@ -163,7 +163,12 @@ async fn read(conn: Weak<Conn>, mut lines: Lines<BufReader<ChildStdout>>, stderr
     while let Ok(Some(line)) = lines.next_line().await {
         if let Ok(msg) = serde_json::from_str::<Value>(&line) {
             let Some(conn) = conn.upgrade() else { return };
-            conn.dispatch(msg).await;
+            let response = conn.dispatch(msg);
+            let stdin = conn.stdin.clone();
+            drop(conn); // A blocked automatic reply must not keep the SSH child alive.
+            if let Some(response) = response {
+                let _ = write_message(&stdin, response).await;
+            }
         }
     }
     let why = exited(stderr.await.unwrap_or_default());
@@ -178,6 +183,14 @@ async fn read(conn: Weak<Conn>, mut lines: Lines<BufReader<ChildStdout>>, stderr
     conn.listeners.lock().unwrap().clear();
 }
 
+async fn write_message(stdin: &tokio::sync::Mutex<ChildStdin>, msg: Value) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(&msg).expect("serializable");
+    line.push(b'\n');
+    let mut stdin = stdin.lock().await;
+    stdin.write_all(&line).await?;
+    stdin.flush().await
+}
+
 impl Conn {
     pub fn alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
@@ -187,7 +200,7 @@ impl Conn {
         self.closed.lock().unwrap().clone()
     }
 
-    async fn dispatch(&self, msg: Value) {
+    fn dispatch(&self, msg: Value) -> Option<Value> {
         let session = msg["params"]["sessionId"].as_str().unwrap_or_default().to_owned();
         match (msg["method"].as_str(), msg.get("id").cloned()) {
             (Some("session/update"), None) => {
@@ -201,17 +214,17 @@ impl Conn {
                 if delivered {
                     self.permissions.lock().unwrap().entry(session).or_default().push(id);
                 } else {
-                    self.respond(id, json!({ "outcome": { "outcome": "cancelled" } })).await;
+                    return Some(json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": { "outcome": "cancelled" } } }));
                 }
             }
             (Some(_), Some(id)) => {
                 // We advertise no client capabilities (fs, terminal), so nothing else should arrive.
                 let error = json!({ "code": -32601, "message": "Method not found" });
-                let _ = self.write(json!({ "jsonrpc": "2.0", "id": id, "error": error })).await;
+                return Some(json!({ "jsonrpc": "2.0", "id": id, "error": error }));
             }
             (Some(_), None) => {}
             (None, Some(id)) => {
-                let Some(tx) = id.as_i64().and_then(|id| self.pending.lock().unwrap().remove(&id)) else { return };
+                let Some(tx) = id.as_i64().and_then(|id| self.pending.lock().unwrap().remove(&id)) else { return None };
                 let result = match msg.get("error") {
                     Some(e) => Err(Error::Http(e["message"].as_str().unwrap_or("Hermes returned an error").to_owned())),
                     None => Ok(msg["result"].clone()),
@@ -220,14 +233,11 @@ impl Conn {
             }
             (None, None) => {}
         }
+        None
     }
 
     async fn write(&self, msg: Value) -> Result<(), Error> {
-        let mut line = serde_json::to_vec(&msg).expect("serializable");
-        line.push(b'\n');
-        let mut stdin = self.stdin.lock().await;
-        let written = async { stdin.write_all(&line).await.and(stdin.flush().await) }.await;
-        written.map_err(|_| Error::Unreachable(self.closed_reason()))
+        write_message(&self.stdin, msg).await.map_err(|_| Error::Unreachable(self.closed_reason()))
     }
 
     async fn respond(&self, id: Value, result: Value) {
@@ -462,11 +472,18 @@ mod tests {
             printf 'hermes-desktop-home /tmp\n'
             read -r request
             printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+            read -r request
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"unsupported"}'
             while read -r request; do :; done
         "#]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
             .kill_on_drop(true).spawn().unwrap();
         let conn = tokio::time::timeout(Duration::from_secs(5), connect_child("test", child)).await.unwrap().unwrap();
         let weak = Arc::downgrade(&conn);
+        let stdin = conn.stdin.clone();
+        let mut locked = stdin.lock().await;
+        locked.write_all(b"trigger\n").await.unwrap();
+        // Hold the writer while the reader handles the automatic method-not-found reply.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         drop(conn);
         assert!(weak.upgrade().is_none(), "the reader must not own the SSH child after a Profile switch");
     }
