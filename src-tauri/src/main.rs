@@ -66,6 +66,22 @@ struct Inner {
 }
 
 impl Inner {
+    fn restore_creds(&mut self, stored: Option<Creds>) {
+        self.creds = match (stored, &self.gateway) {
+            (Some(c), Some(g)) if c.dashboard_url == g.dashboard.as_str() && c.api_url == g.api.as_str() => c,
+            (stored, gateway) => {
+                if stored.is_some() {
+                    log::write("keyring", "stored credentials belong to a different gateway; ignoring them");
+                }
+                Creds {
+                    dashboard_url: gateway.as_ref().map_or_else(String::new, |g| g.dashboard.to_string()),
+                    api_url: gateway.as_ref().map_or_else(String::new, |g| g.api.to_string()),
+                    ..Creds::default()
+                }
+            }
+        };
+    }
+
     fn named_profile(&self) -> Option<&str> {
         self.profile.as_deref().filter(|p| *p != "default")
     }
@@ -305,14 +321,7 @@ async fn init(state: State<'_, AppState>) -> Result<Init, Error> {
     let (stored, keyring) = async_runtime::spawn_blocking(load_creds).await.unwrap_or((None, false));
     let mut inner = state.lock();
     inner.keyring = keyring;
-    inner.creds = match (stored, &inner.gateway) {
-        (Some(c), Some(g)) if c.dashboard_url == g.dashboard.as_str() && c.api_url == g.api.as_str() => c,
-        (Some(_), _) => {
-            log::write("keyring", "stored credentials belong to a different gateway; ignoring them");
-            Creds::default()
-        }
-        (None, _) => Creds::default(),
-    };
+    inner.restore_creds(stored);
     Ok(Init {
         dashboard_url: inner.gateway.as_ref().map(|g| g.dashboard.to_string()),
         api_url: inner.gateway.as_ref().map(|g| g.api.to_string()),
@@ -1310,6 +1319,27 @@ mod tests {
         assert_eq!(only_png(png.clone()), png);
         assert!(only_png(b"<b>bold</b>".to_vec()).is_empty()); // xclip -t text/html, asked for image/png
         assert!(only_png(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn reauthenticated_credentials_survive_restart_and_stay_host_bound() {
+        let state = state_as(None, None);
+        let mut inner = state.lock();
+        for stored in [None, Some(Creds { dashboard_url: "http://other/".into(), api_key: Some("old".into()), ..Creds::default() })] {
+            inner.restore_creds(stored);
+            assert!(inner.creds.api_key.is_none());
+            inner.replace_key(Some("new".into()));
+            inner.creds.cookies.insert("session".into(), "cookie".into());
+            let saved = serde_json::to_string(&inner.creds).unwrap();
+            inner.restore_creds(Some(serde_json::from_str(&saved).unwrap()));
+            assert_eq!(inner.api_key(), Some("new"));
+            assert_eq!(inner.creds.cookies.get("session").map(String::as_str), Some("cookie"));
+        }
+        inner.gateway.as_mut().unwrap().api = Url::parse("http://other/").unwrap();
+        let saved = inner.creds.clone();
+        inner.restore_creds(Some(saved));
+        assert!(inner.api_key().is_none());
+        assert!(inner.creds.cookies.is_empty());
     }
 
     #[test]
